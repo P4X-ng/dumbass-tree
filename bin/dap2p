@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""dap2p - peer-to-peer links for when you just want two machines to talk.
+
+This covers 3 common cases:
+
+1) Ethernet cable between two machines
+   - easiest: static IPv4 on both sides
+   - even easier: IPv6 link-local usually "just works"
+
+2) USB gadget networking (ONE side must support USB device/gadget mode)
+   - g_ether gives you a usb0 interface
+   - great for ssh/scp
+
+3) USB gadget mass storage (ONE side gadget-capable)
+   - expose a file as a fake USB thumb drive via g_mass_storage
+   - great for "here's a disk", but treat it like a real thumb drive (don't mount RW on both sides)
+
+IMPORTANT:
+- Two normal laptops connected by a plain USB-C to USB-C cable are usually *host-host*.
+  That does NOT create a network link by magic. Use Ethernet, Thunderbolt/USB4 networking,
+  or a proper USB bridge cable, or gadget mode on one side.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import sys
+
+from dumbasslib import (
+    confirm_two_tier_or_exit,
+    die,
+    info,
+    require_cmd,
+    require_root,
+    run,
+)
+
+
+def _have_udc() -> bool:
+    p = pathlib.Path("/sys/class/udc")
+    return p.exists() and any(p.iterdir())
+
+
+def cmd_eth_up(args: argparse.Namespace) -> None:
+    require_root()
+    iface = args.iface
+    addr = args.addr
+
+    confirm_two_tier_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"Configure {iface} with static address {addr}",
+        reason="You can break your current networking on this interface.",
+        alternatives=[
+            "Use a dedicated port for P2P if possible.",
+            "If you just need a quick link, consider IPv6 link-local (often already up).",
+        ],
+        typed=f"YES CONFIG {iface}",
+    )
+
+    run(["ip", "link", "set", "dev", iface, "up"], dry_run=args.dry_run, verbose=args.verbose)
+    # remove existing addr if requested
+    if args.flush:
+        run(["ip", "addr", "flush", "dev", iface], dry_run=args.dry_run, verbose=args.verbose)
+    run(["ip", "addr", "add", addr, "dev", iface], dry_run=args.dry_run, verbose=args.verbose)
+    info("done. On the other machine, set a different address in the same /24.")
+    print("\nExample other side:")
+    print(f"  sudo ip link set dev {iface} up")
+    print(f"  sudo ip addr add 192.168.77.2/24 dev {iface}")
+    print("\nTest:")
+    print("  ping 192.168.77.2")
+
+
+def cmd_gadget_net(args: argparse.Namespace) -> None:
+    require_root()
+    if not _have_udc():
+        die("No USB Device Controller found (/sys/class/udc empty). This machine likely cannot act as a USB gadget/device.")
+    confirm_two_tier_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt="Load g_ether (USB Ethernet gadget)",
+        reason="This will change USB gadget state; unplug/replug may be needed.",
+        alternatives=[
+            "If you're trying to connect two laptops, use Ethernet or Thunderbolt networking instead.",
+        ],
+        typed="YES LOAD G_ETHER",
+    )
+    run(["modprobe", "g_ether"], dry_run=args.dry_run, verbose=args.verbose)
+    info("Loaded g_ether. You should see a usb0 interface.")
+    run(["ip", "-br", "link"], check=False)
+
+
+def cmd_gadget_msd(args: argparse.Namespace) -> None:
+    require_root()
+    if not _have_udc():
+        die("No USB Device Controller found (/sys/class/udc empty). This machine likely cannot act as a USB gadget/device.")
+    backing = args.backing
+    if not os.path.exists(backing):
+        die(f"backing file not found: {backing}")
+    # two-tier warning because this can corrupt data if mounted RW on both ends
+    confirm_two_tier_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"Expose {backing} as a USB Mass Storage device (g_mass_storage)",
+        reason="If you mount it read-write on both sides at once, you WILL corrupt it.",
+        alternatives=[
+            "Use USB Ethernet gadget instead (dap2p gadget net) if you want ssh/scp.",
+            "Export it read-only with --ro if you just want to copy out.",
+        ],
+        typed="YES I UNDERSTAND CORRUPTION",
+    )
+    ro = "1" if args.ro else "0"
+    removable = "1"
+    # Module options: file=... ro=... removable=...
+    run(["modprobe", "g_mass_storage", f"file={backing}", f"ro={ro}", f"removable={removable}"], dry_run=args.dry_run, verbose=args.verbose)
+    info("Loaded g_mass_storage. Plug into the host; it should appear as a USB disk.")
+
+
+def cmd_gadget_off(args: argparse.Namespace) -> None:
+    require_root()
+    # attempt to unload common gadget modules
+    for mod in ("g_mass_storage", "g_ether"):
+        run(["modprobe", "-r", mod], check=False, dry_run=args.dry_run, verbose=args.verbose)
+    info("Attempted to unload gadget modules.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dap2p", description=__doc__)
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--dry-run", action="store_true")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    eth = sub.add_parser("eth", help="ethernet cable P2P helpers")
+    eth_sub = eth.add_subparsers(dest="eth_cmd", required=True)
+
+    s = eth_sub.add_parser("up", help="bring iface up + add static IPv4 addr (P2P)")
+    s.add_argument("iface")
+    s.add_argument("addr", help="e.g. 192.168.77.1/24")
+    s.add_argument("--flush", action="store_true", help="flush existing addresses first")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_eth_up)
+
+    gad = sub.add_parser("gadget", help="USB gadget mode (requires gadget-capable hardware)")
+    gad_sub = gad.add_subparsers(dest="g_cmd", required=True)
+
+    s = gad_sub.add_parser("net", help="USB Ethernet gadget (g_ether)")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_gadget_net)
+
+    s = gad_sub.add_parser("msd", help="USB Mass Storage gadget (g_mass_storage) backed by a file")
+    s.add_argument("backing", help="path to backing file (e.g. created with dadd fatimg create)")
+    s.add_argument("--ro", action="store_true", help="read-only export")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_gadget_msd)
+
+    s = gad_sub.add_parser("off", help="unload gadget modules")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_gadget_off)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

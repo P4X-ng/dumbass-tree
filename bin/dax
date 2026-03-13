@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""dax - dumbass-friendly display stack status (X11 vs Wayland).
+
+You asked: "what even IS Wayland"?
+
+Wayland is a display *protocol* and architecture. Your desktop's
+*compositor* (GNOME Mutter, KDE KWin, Sway, Hyprland, etc.) is the
+"server" that draws windows and routes input.
+
+This tool is not magic. It just answers:
+- Am I on X11 or Wayland right now?
+- If Wayland, is XWayland running for legacy X apps?
+- What desktop/compositor do I appear to be using?
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+
+_THIS = Path(__file__).resolve()
+sys.path.insert(0, str(_THIS.parent))
+
+from dumbasslib import require_cmd, run, warn  # noqa: E402
+
+
+def _have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _session_type() -> str:
+    # Best signal: XDG_SESSION_TYPE
+    t = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if t in ("x11", "wayland"):
+        return t
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "unknown"
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    st = _session_type()
+    print(f"session: {st}")
+    print(f"XDG_CURRENT_DESKTOP: {os.environ.get('XDG_CURRENT_DESKTOP','')}")
+    print(f"XDG_SESSION_DESKTOP: {os.environ.get('XDG_SESSION_DESKTOP','')}")
+    print(f"WAYLAND_DISPLAY: {os.environ.get('WAYLAND_DISPLAY','')}")
+    print(f"DISPLAY: {os.environ.get('DISPLAY','')}")
+    print(f"GDK_BACKEND: {os.environ.get('GDK_BACKEND','')}")
+    print(f"QT_QPA_PLATFORM: {os.environ.get('QT_QPA_PLATFORM','')}")
+    print(f"XDG_SESSION_ID: {os.environ.get('XDG_SESSION_ID','')}")
+    print()
+
+    if _have("loginctl") and os.environ.get("XDG_SESSION_ID"):
+        sid = os.environ["XDG_SESSION_ID"]
+        rr = run(
+            ["loginctl", "show-session", sid, "-p", "Type", "-p", "Desktop", "-p", "Remote", "-p", "State"],
+            capture=True,
+            check=False,
+            dry_run=False,
+        )
+        print("loginctl:")
+        print(rr.stdout.strip() or "(no output)")
+        print()
+
+    # Is XWayland running?
+    if _have("pgrep"):
+        rr = run(["pgrep", "-x", "Xwayland"], capture=True, check=False, dry_run=False)
+        if rr.returncode == 0:
+            print("XWayland: running (legacy X11 apps should work)")
+        else:
+            print("XWayland: not detected")
+    else:
+        warn("pgrep not found; can't detect XWayland")
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    print(
+        """Wayland vs X11 (dumbass edition)
+
+- X11 (Xorg) is the old display server world. It was built when "remote display" was a first-class feature.
+  The X server also historically exposed a ton of global state to clients.
+
+- Wayland is a replacement display protocol + architecture.
+  Your compositor *is* the display server.
+
+Practical consequences:
+- Wayland can be simpler and more secure: clients don't get to casually snoop on other windows/surfaces.
+- Some workflows change: screen sharing/screen capture are compositor- / portal-mediated, not "any app can grab the screen".
+- Legacy X11 apps generally run via XWayland (an X server that runs as a Wayland client).
+
+If you just want to know "what am I on right now?": run `dax status`.
+"""
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dax", description="Display stack helper (X11 vs Wayland)")
+    p.add_argument("--dry-run", action="store_true", help="(unused) kept for CLI consistency")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("status", help="Show whether you're on X11 or Wayland, and some env hints")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("explain", help="Explain Wayland vs X11 in plain English")
+    sp.set_defaults(func=cmd_explain)
+
+    return p
+
+
+def main(argv: list[str]) -> None:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

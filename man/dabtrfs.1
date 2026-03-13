@@ -1,0 +1,34 @@
+.TH DABTRFS 1 "2025-12-29" "dumbass-tree" "User Commands"
+.SH NAME
+dabtrfs \- dumbass-friendly Btrfs helper (Linux)
+.SH SYNOPSIS
+.B dabtrfs
+[\-\-dry-run] [\-\-verbose]
+.I <command>
+[\fIargs\fR]
+.SH DESCRIPTION
+dabtrfs wraps common btrfs(8) workflows: subvolumes, snapshots, scrub, balance, and mounting with compression.
+.SH COMMANDS
+.TP
+.B dabtrfs subvol create \fIpath\fR
+Create subvolume.
+.TP
+.B dabtrfs subvol list \fImountpoint\fR
+List subvolumes.
+.TP
+.B dabtrfs snapshot \fIsrc\fR \fIdst\fR [\-\-readonly]
+Create snapshot.
+.TP
+.B dabtrfs scrub start|status \fImountpoint\fR
+Start scrub or show status.
+.TP
+.B dabtrfs balance start \fImountpoint\fR [\-\-dusage PCT] [\-\-musage PCT]
+Start a filtered balance.
+.TP
+.B dabtrfs df \fImountpoint\fR
+Show filesystem usage.
+.TP
+.B dabtrfs mount \fIdevice\fR \fImountpoint\fR [\-\-compress ALG] [\-\-noatime]
+Mount with common options.
+.SH SEE ALSO
+btrfs(8), mkfs.btrfs(8)

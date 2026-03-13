@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""dazfs - dumbass-friendly ZFS helper.
+
+This is a thin wrapper around `zpool` and `zfs` that focuses on:
+- creating pools with sensible defaults
+- creating datasets (filesystems) with mountpoints + compression profiles
+- building a "one big tree" layout (datasets mounted under a single root)
+- snapshots + rollback
+- scrub/status shortcuts
+- `--dry-run` so you can see what will happen first
+
+It is intentionally conservative and will refuse irreversible or destructive
+operations unless `--yes` is provided *or* you confirm interactively.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+# Allow imports even when this script is invoked via a symlink somewhere else.
+_THIS = Path(__file__).resolve()
+sys.path.insert(0, str(_THIS.parent))
+
+from dumbasslib import confirm_or_exit, die, info, require_cmds, require_root, run, warn  # noqa: E402
+
+
+def _now_tag() -> str:
+    # local time, predictable format
+    return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _compression_candidates(profile_or_value: str) -> list[str]:
+    v = profile_or_value.strip().lower()
+    if v in {"off", "disable", "disabled", "none"}:
+        return ["off"]
+    if v in {"fast", "lz4"}:
+        return ["lz4"]
+    if v in {"balanced", "default"}:
+        # Try zstd with a modest level first, then fall back.
+        return ["zstd-3", "zstd", "lz4"]
+    if v in {"max", "maximum"}:
+        # Higher zstd levels can be expensive. This is a "choose CPU for ratio" profile.
+        return ["zstd-10", "zstd-9", "zstd", "lz4"]
+    # Explicit value: try as-is, then a safe fallback.
+    return [profile_or_value, "lz4"]
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    require_cmds(["zpool", "zfs"])
+    pool = args.pool
+
+    if pool:
+        run(["zpool", "status", "-v", pool], dry_run=args.dry_run, verbose=args.verbose)
+        run(
+            ["zfs", "list", "-o", "name,used,avail,refer,mountpoint", "-r", pool],
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+    else:
+        run(["zpool", "status", "-v"], dry_run=args.dry_run, verbose=args.verbose)
+        run(["zpool", "list"], dry_run=args.dry_run, verbose=args.verbose)
+        run(
+            ["zfs", "list", "-o", "name,used,avail,refer,mountpoint"],
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+
+
+def _pool_layout_argv(layout: str, devices: list[str]) -> list[str]:
+    layout = layout.lower()
+    if layout == "stripe":
+        return devices
+    if layout == "mirror":
+        return ["mirror", *devices]
+    if layout in {"raidz1", "raidz2", "raidz3"}:
+        # zpool uses "raidz", "raidz2", "raidz3" keywords
+        kw = "raidz" if layout == "raidz1" else layout
+        return [kw, *devices]
+    die(f"unknown layout: {layout}")
+
+
+def cmd_pool_create(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zpool", "zfs"])
+
+    if len(args.devices) < 1:
+        die("need at least one device")
+
+    argv = ["zpool", "create"]
+
+    if args.force:
+        argv.append("-f")
+
+    # pool properties (-o)
+    argv += ["-o", f"ashift={args.ashift}"]
+    for p in args.pool_property:
+        argv += ["-o", p]
+
+    # filesystem properties for the root dataset (-O)
+    fsprops = list(args.fs_property)
+    if not args.no_defaults:
+        # safe-ish cross-platform defaults
+        fsprops = ["atime=off", "compression=lz4"] + fsprops
+    for p in fsprops:
+        argv += ["-O", p]
+
+    if args.mountpoint:
+        argv += ["-m", args.mountpoint]
+
+    argv.append(args.name)
+    argv += _pool_layout_argv(args.layout, args.devices)
+
+    confirm_or_exit(
+        yes=getattr(args, 'yes', False),
+        dry_run=args.dry_run,
+        prompt=(
+            f"About to CREATE pool {args.name!r} ({args.layout}) on devices:\n"
+            + "\n".join(f"  - {d}" for d in args.devices)
+        ),
+        reason=
+        "zpool create writes labels and can DESTROY existing data on those devices.",
+        alternatives=[
+            "Run with --dry-run to see the exact zpool command",
+            "Use /dev/disk/by-id/... and verify disks with: lsblk -o NAME,SIZE,MODEL,SERIAL",
+            "If you expected an existing pool, you probably want: zpool import",
+        ],
+        typed=args.name,
+    )
+
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+    # Optional: show status right after creation (helps catch typos).
+    if not args.dry_run and args.show_status:
+        run(["zpool", "status", "-v", args.name], verbose=max(args.verbose, 1))
+
+
+def cmd_pool_list(args: argparse.Namespace) -> None:
+    require_cmds(["zpool"])
+    run(["zpool", "list"], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_pool_scrub(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zpool"])
+    run(["zpool", "scrub", args.name], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_pool_add(args: argparse.Namespace) -> None:
+    """Add a vdev to an existing pool.
+
+    This is the ZFS "make it one bigger virtual filesystem" move: you add one or more
+    vdevs to a pool and capacity grows.
+
+    WARNING: This is essentially irreversible and can change redundancy.
+    """
+
+    require_root()
+    require_cmds(["zpool"])
+
+    if len(args.devices) < 1:
+        die("need at least one device")
+
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=(
+            f"About to ADD a vdev to pool {args.name!r}:\n"
+            + f"  layout: {args.layout}\n"
+            + "\n".join(f"  - {d}" for d in args.devices)
+        ),
+        reason=(
+            "Adding vdevs is effectively permanent and can change the pool's redundancy/failure domains. "
+            "If you add a single-disk vdev to an otherwise-redundant pool, that disk can become a single point of failure."
+        ),
+        alternatives=[
+            "Run: zpool status -v <pool> (understand the current vdev layout first)",
+            "Prefer adding redundancy-matching vdevs (mirror to mirror, raidz to raidz)",
+            "If you meant 'mirror this disk', you may want: dazfs pool attach <pool> <existing> <new>",
+            "Use --dry-run first to sanity-check device paths",
+        ],
+    )
+
+    argv = ["zpool", "add"]
+    if args.force:
+        argv.append("-f")
+    argv.append(args.name)
+    argv += _pool_layout_argv(args.layout, args.devices)
+
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_pool_attach(args: argparse.Namespace) -> None:
+    """Attach a new disk to an existing vdev (commonly: turn a single disk into a mirror)."""
+
+    require_root()
+    require_cmds(["zpool"])
+
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=(
+            f"About to ATTACH {args.new_device} to {args.existing_device} in pool {args.name!r} (turning it into a mirror)."
+        ),
+        reason="Device operations are easy to get wrong; attaching the wrong disk can destroy data.",
+        alternatives=[
+            "Run: zpool status -v <pool> (copy/paste the exact existing device path from there)",
+            "Prefer /dev/disk/by-id/... for NEW devices (stable names)",
+            "Verify disks with: lsblk -o NAME,SIZE,MODEL,SERIAL",
+            "Use --dry-run first to sanity-check the exact zpool command",
+        ],
+    )
+
+    argv = ["zpool", "attach"]
+    if args.force:
+        argv.append("-f")
+    argv += [args.name, args.existing, args.new]
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_pool_destroy(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zpool"])
+
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"About to DESTROY pool {args.name!r}.",
+        reason="This is permanent and will make all data in the pool inaccessible.",
+        alternatives=[
+            "If you meant 'export' for later import: zpool export <pool>",
+            "If you meant 'clear errors': zpool clear <pool>",
+            "Use --dry-run first",
+        ],
+        typed=f"DESTROY {args.name}",
+    )
+
+    argv = ["zpool", "destroy"]
+    if args.force:
+        argv.append("-f")
+    argv.append(args.name)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_ds_create(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zfs"])
+
+    argv = ["zfs", "create"]
+    if not args.no_parents:
+        argv.append("-p")
+
+    # Properties
+    props: list[str] = []
+    if args.mountpoint is not None:
+        props.append(f"mountpoint={args.mountpoint}")
+    if args.canmount is not None:
+        props.append(f"canmount={args.canmount}")
+    if args.atime is not None:
+        props.append(f"atime={args.atime}")
+    if args.recordsize is not None:
+        props.append(f"recordsize={args.recordsize}")
+    if args.quota is not None:
+        props.append(f"quota={args.quota}")
+    if args.refquota is not None:
+        props.append(f"refquota={args.refquota}")
+
+    if args.compression is not None:
+        # We'll set compression after creation, because we may need fallbacks.
+        pass
+
+    for p in props + list(args.property):
+        argv += ["-o", p]
+
+    argv.append(args.name)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+    if args.compression is not None:
+        # Apply compression profile/value with fallbacks.
+        _apply_compression(args.name, args.compression, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_ds_list(args: argparse.Namespace) -> None:
+    require_cmds(["zfs"])
+    target = args.target
+    argv = ["zfs", "list", "-o", "name,used,avail,refer,mountpoint"]
+    if args.recursive:
+        argv.append("-r")
+    if target:
+        argv.append(target)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_ds_mountpoint(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zfs"])
+    run(
+        ["zfs", "set", f"mountpoint={args.mountpoint}", args.dataset],
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+    )
+    if args.mount_now:
+        run(["zfs", "mount", args.dataset], dry_run=args.dry_run, verbose=args.verbose, check=False)
+
+
+def _apply_compression(dataset: str, profile_or_value: str, *, dry_run: bool, verbose: int) -> None:
+    require_root()
+    require_cmds(["zfs"])
+
+    candidates = _compression_candidates(profile_or_value)
+    last_err = None
+
+    for c in candidates:
+        res = run(
+            ["zfs", "set", f"compression={c}", dataset],
+            dry_run=dry_run,
+            verbose=verbose,
+            check=False,
+            capture=True,
+        )
+        if dry_run:
+            return
+        if res.returncode == 0:
+            info(f"compression set: {dataset} -> {c}")
+            return
+        last_err = res.stderr.strip() or res.stdout.strip() or f"(exit {res.returncode})"
+
+    die(f"failed to set compression on {dataset} (tried: {', '.join(candidates)}). Last error: {last_err}")
+
+
+def cmd_ds_compression(args: argparse.Namespace) -> None:
+    profile = args.profile if args.profile is not None else args.value
+    if not profile:
+        die("need --profile or --value")
+    _apply_compression(args.dataset, profile, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_ds_props(args: argparse.Namespace) -> None:
+    require_cmds(["zfs"])
+    props = [
+        "type",
+        "used",
+        "available",
+        "referenced",
+        "mountpoint",
+        "canmount",
+        "compression",
+        "recordsize",
+        "atime",
+        "exec",
+        "setuid",
+        "snapdir",
+    ]
+    argv = ["zfs", "get", "-H", "-o", "property,value", ",".join(props), args.dataset]
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_ds_destroy(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zfs"])
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"About to DESTROY dataset {args.name!r}.",
+        reason="Dataset destroy is permanent (unless you have snapshots/replication elsewhere).",
+        alternatives=[
+            "If you only want to hide it from mounting: zfs set canmount=off <dataset>",
+            "If you meant to remove contents but keep dataset: rm -rf <mountpoint>/* (careful!)",
+            "Use --dry-run first",
+        ],
+        typed=f"DESTROY {args.name}",
+    )
+
+    argv = ["zfs", "destroy"]
+    if args.recursive:
+        argv.append("-r")
+    if args.force:
+        argv.append("-f")
+    argv.append(args.dataset)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_mount(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zfs"])
+    run(["zfs", "mount", args.dataset], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_unmount(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zfs"])
+    argv = ["zfs", "unmount"]
+    if args.force:
+        argv.append("-f")
+    argv.append(args.dataset)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_snap_create(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zfs"])
+    snap_name = args.name or f"dazfs-{_now_tag()}"
+    full = f"{args.dataset}@{snap_name}"
+    run(["zfs", "snapshot", full], dry_run=args.dry_run, verbose=args.verbose)
+    if not args.dry_run:
+        info(full)
+
+
+def cmd_snap_list(args: argparse.Namespace) -> None:
+    require_cmds(["zfs"])
+    run(["zfs", "list", "-t", "snapshot", "-r", args.dataset], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_snap_rollback(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["zfs"])
+
+    if "@" not in args.snapshot:
+        die("rollback target must be a snapshot like pool/ds@snapname")
+
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"About to ROLLBACK to snapshot {args.snapshot!r}.",
+        reason="Rollback is destructive: current changes since that snapshot will be lost.",
+        alternatives=[
+            "Create a safety snapshot first: zfs snapshot <dataset>@before-rollback",
+            "List snapshots: dazfs snap list <dataset>",
+            "Use --dry-run first",
+        ],
+        typed=f"ROLLBACK {args.snapshot}",
+    )
+
+    argv = ["zfs", "rollback"]
+    if args.force:
+        argv.append("-f")
+    argv.append(args.snapshot)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def _zfs_get_value(dataset: str, prop: str, *, dry_run: bool, verbose: int) -> str | None:
+    """Return a zfs property value, or None if we can't read it."""
+
+    require_cmds(["zfs"])
+    rr = run(
+        ["zfs", "get", "-H", "-o", "value", prop, dataset],
+        dry_run=dry_run,
+        verbose=verbose,
+        check=False,
+        capture=True,
+    )
+    if dry_run:
+        return None
+    if rr.returncode != 0:
+        return None
+    return rr.stdout.strip()
+
+
+@dataclass(frozen=True)
+class _TreeItem:
+    ds_suffix: str
+    rel_mount: str
+    props: tuple[str, ...] = ()
+    compression: str | None = None
+
+
+_TREE_STYLES: dict[str, list[_TreeItem]] = {
+    # "one big tree" under a root mountpoint (default vibe)
+    "vault": [
+        _TreeItem("home", "home"),
+        _TreeItem("media", "media", props=("recordsize=1M",), compression="fast"),
+        _TreeItem("backups", "backups"),
+        _TreeItem("scratch", "scratch", compression="off"),
+        _TreeItem("vm", "vm", props=("recordsize=64K",), compression="fast"),
+        _TreeItem("containers", "containers", props=("canmount=off", "mountpoint=none")),
+    ],
+    "minimal": [
+        _TreeItem("data", "data"),
+        _TreeItem("backups", "backups"),
+    ],
+    # A "NAS-ish" layout that people commonly want
+    "nas": [
+        _TreeItem("share", "share"),
+        _TreeItem("media", "media", props=("recordsize=1M",), compression="fast"),
+        _TreeItem("backups", "backups"),
+        _TreeItem("timemachine", "timemachine"),
+    ],
+}
+
+
+def cmd_tree_init(args: argparse.Namespace) -> None:
+    """Create a dataset layout that *looks like one filesystem tree*.
+
+    This does NOT do a union-mount of multiple sources into the same directory.
+    Instead it uses ZFS's superpower: datasets can mount anywhere, so you can mount
+    multiple datasets *under one root directory*.
+
+    Example:
+      pool = tank, root = /tank
+      tank/media mounts at /tank/media
+      tank/backups mounts at /tank/backups
+
+    Result: it feels like "one big filesystem" but each subtree is separately tunable.
+    """
+
+    require_root()
+    require_cmds(["zfs"])
+
+    style = args.style.lower()
+    if style not in _TREE_STYLES:
+        die(f"unknown style: {args.style} (choose: {', '.join(sorted(_TREE_STYLES))})")
+
+    pool = args.pool
+
+    existing_mp = _zfs_get_value(pool, "mountpoint", dry_run=args.dry_run, verbose=args.verbose)
+
+    # Decide root mountpoint
+    root = args.root
+    if root is None:
+        if existing_mp and existing_mp not in {"none", "legacy"}:
+            root = existing_mp
+        else:
+            root = f"/{pool}"
+
+    if not root.startswith("/"):
+        die("--root must be an absolute path, e.g. /tank")
+
+    # If the pool has a different mountpoint already, require --yes to change it.
+    if (
+        existing_mp
+        and existing_mp not in {"none", "legacy"}
+        and existing_mp != root
+        and not args.yes
+    ):
+        die(f"pool {pool} already has mountpoint {existing_mp}; changing to {root} requires --yes")
+
+    if existing_mp == "legacy":
+        warn(
+            "pool mountpoint is 'legacy' (fstab-managed). tree init assumes ZFS-managed mountpoints."
+        )
+
+    # Ensure the root directory exists.
+    if not args.dry_run:
+        os.makedirs(root, exist_ok=True)
+
+    # Set pool root dataset mountpoint (if needed)
+    if existing_mp != root and existing_mp != "legacy":
+        run(["zfs", "set", f"mountpoint={root}", pool], dry_run=args.dry_run, verbose=args.verbose)
+
+    default_atime = "off" if not args.no_defaults else None
+    default_compression = args.compression
+
+    created: list[str] = []
+
+    for item in _TREE_STYLES[style]:
+        ds = f"{pool}/{item.ds_suffix}"
+
+        # If item has canmount=off/mountpoint=none, don't try to compute a mount path.
+        item_props = list(item.props)
+
+        # Only set mountpoint if item didn't hardcode mountpoint=none
+        if not any(p.startswith("mountpoint=") for p in item_props):
+            mp = os.path.join(root, item.rel_mount)
+            if not args.dry_run:
+                os.makedirs(mp, exist_ok=True)
+            item_props.insert(0, f"mountpoint={mp}")
+
+        if default_atime is not None and not any(p.startswith("atime=") for p in item_props):
+            item_props.append(f"atime={default_atime}")
+
+        argv = ["zfs", "create", "-p"]
+        for p in item_props + list(args.property):
+            argv += ["-o", p]
+        argv.append(ds)
+        run(argv, dry_run=args.dry_run, verbose=args.verbose)
+        created.append(ds)
+
+        # Compression: per-item override wins, then default, then skip.
+        comp = item.compression or default_compression
+        if comp:
+            _apply_compression(ds, comp, dry_run=args.dry_run, verbose=args.verbose)
+
+    if args.mount_now:
+        # Mount just what we created (not everything on the system)
+        for ds in created:
+            run(["zfs", "mount", ds], dry_run=args.dry_run, verbose=args.verbose, check=False)
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    topic = args.topic.lower().strip()
+
+    blurbs = {
+        "dataset": """ZFS dataset = a thing inside a pool with its own properties.
+Most commonly it's a filesystem like tank/home.
+It can have its own mountpoint, compression, quota, snapshots, etc.
+""",
+        "pool": """ZFS pool = storage built from disks (vdevs).
+You create it with zpool create. Inside it you create datasets.
+""",
+        "vdev": """vdev = virtual device. A pool is made of one or more vdevs.
+A vdev can be a single disk, mirror, raidz group, etc.
+Performance and redundancy are mostly determined by vdev layout.
+""",
+        "mountpoint": """In ZFS, mountpoint is a property on the dataset.
+Set it with: zfs set mountpoint=/path pool/ds
+Then ZFS mounts it (often automatically via the ZFS mount service).
+""",
+        "canmount": """canmount controls whether a dataset is allowed to mount:
+- on: normal behavior
+- noauto: only mount if you explicitly run zfs mount
+- off: never mount (often used for 'container' datasets)
+""",
+        "compression": """compression is a dataset property. lz4 is the usual safe default.
+zstd-3 often gives better ratio with moderate CPU.
+High zstd levels can be CPU-heavy on write-heavy workloads.
+""",
+        "onefs": """ZFS doesn't do a union-mount (merge two directories into one).
+But it *does* do the thing most people mean by 'one virtual filesystem':
+
+1) A pool is a big virtual storage bucket made from disks/vdevs.
+2) Datasets can mount anywhere, so you can mount multiple datasets under one root.
+
+Try:
+  dazfs tree init tank --root /tank --style vault
+""",
+    }
+
+    blurb = blurbs.get(topic)
+    if not blurb:
+        die(
+            f"unknown topic: {args.topic} (try: dataset, pool, vdev, mountpoint, canmount, compression, onefs)"
+        )
+
+    print(blurb.strip())
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dazfs", description="dumbass-friendly ZFS helper")
+    p.add_argument("--dry-run", action="store_true", help="print commands instead of executing")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="more output (repeatable)")
+
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    # status
+    ps = sp.add_parser("status", help="show pool + dataset status")
+    ps.add_argument("--pool", help="focus on a specific pool")
+    ps.set_defaults(func=cmd_status)
+
+    # explain
+    pe = sp.add_parser("explain", help="quick explanations of ZFS terms")
+    pe.add_argument("topic", help="dataset|pool|vdev|mountpoint|canmount|compression|onefs")
+    pe.set_defaults(func=cmd_explain)
+
+    # tree
+    pt = sp.add_parser("tree", help="build a 'one big tree' dataset layout")
+    pts = pt.add_subparsers(dest="tree_cmd", required=True)
+
+    pti = pts.add_parser("init", help="create a dataset hierarchy mounted under one root")
+    pti.add_argument("pool", help="pool name, e.g. tank")
+    pti.add_argument("--root", help="root mountpoint (default: existing mountpoint, else /<pool>)")
+    pti.add_argument("--style", choices=sorted(_TREE_STYLES.keys()), default="vault")
+    pti.add_argument(
+        "--compression",
+        default="balanced",
+        help="default compression for created datasets (fast|balanced|max|off or explicit value)",
+    )
+    pti.add_argument("--no-defaults", action="store_true", help="do not set atime=off by default")
+    pti.add_argument(
+        "-o",
+        "--property",
+        action="append",
+        default=[],
+        help="extra property key=value applied to ALL created datasets",
+    )
+    pti.add_argument("--mount-now", action="store_true", help="attempt to zfs mount created datasets")
+    pti.add_argument("--yes", action="store_true", help="allow changing pool root mountpoint if needed")
+    pti.set_defaults(func=cmd_tree_init)
+
+    # pool group
+    pp = sp.add_parser("pool", help="pool operations")
+    pps = pp.add_subparsers(dest="pool_cmd", required=True)
+
+    ppc = pps.add_parser("create", help="create a pool")
+    ppc.add_argument("name")
+    ppc.add_argument("devices", nargs="+", help="block devices (prefer /dev/disk/by-id/...)")
+    ppc.add_argument("--yes", action="store_true", help="skip interactive confirmation (DANGEROUS)")
+    ppc.add_argument("--layout", choices=["stripe", "mirror", "raidz1", "raidz2", "raidz3"], default="stripe")
+    ppc.add_argument("--ashift", type=int, default=12, help="sector shift (12=4K, common default)")
+    ppc.add_argument("-m", "--mountpoint", help="mountpoint for root dataset (zpool -m)")
+    ppc.add_argument("-o", "--pool-property", action="append", default=[], help="pool property key=value (zpool -o)")
+    ppc.add_argument("-O", "--fs-property", action="append", default=[], help="fs property key=value (zpool -O)")
+    ppc.add_argument("--no-defaults", action="store_true", help="do not apply default fs props (atime=off, compression=lz4)")
+    ppc.add_argument("-f", "--force", action="store_true", help="pass -f to zpool create")
+    ppc.add_argument("--show-status", action="store_true", help="run zpool status after creation")
+    ppc.set_defaults(func=cmd_pool_create)
+
+    ppl = pps.add_parser("list", help="list pools")
+    ppl.set_defaults(func=cmd_pool_list)
+
+    ppscrub = pps.add_parser("scrub", help="start a scrub")
+    ppscrub.add_argument("name", help="pool name")
+    ppscrub.set_defaults(func=cmd_pool_scrub)
+
+    ppa = pps.add_parser("add", help="add a vdev to a pool (irreversible)")
+    ppa.add_argument("name", help="pool name")
+    ppa.add_argument("devices", nargs="+", help="block devices")
+    ppa.add_argument("--layout", choices=["stripe", "mirror", "raidz1", "raidz2", "raidz3"], default="stripe")
+    ppa.add_argument("--yes", action="store_true", help="required: adding vdevs is irreversible")
+    ppa.add_argument("-f", "--force", action="store_true", help="pass -f to zpool add")
+    ppa.set_defaults(func=cmd_pool_add)
+
+    ppat = pps.add_parser("attach", help="attach a disk to an existing vdev (often: make a mirror)")
+    ppat.add_argument("name", help="pool name")
+    ppat.add_argument("existing", help="existing device in pool (as shown by zpool status)")
+    ppat.add_argument("new", help="new device to attach")
+    ppat.add_argument("--yes", action="store_true", help="required: device ops are scary")
+    ppat.add_argument("-f", "--force", action="store_true", help="pass -f to zpool attach")
+    ppat.set_defaults(func=cmd_pool_attach)
+
+    ppd = pps.add_parser("destroy", help="destroy a pool (DANGEROUS)")
+    ppd.add_argument("name", help="pool name")
+    ppd.add_argument("--yes", action="store_true", help="required: really destroy it")
+    ppd.add_argument("-f", "--force", action="store_true", help="pass -f to zpool destroy")
+    ppd.set_defaults(func=cmd_pool_destroy)
+
+    # dataset group
+    pd = sp.add_parser("ds", help="dataset operations")
+    pds = pd.add_subparsers(dest="ds_cmd", required=True)
+
+    pdc = pds.add_parser("create", help="create dataset (filesystem)")
+    pdc.add_argument("name", help="dataset name, e.g. tank/home")
+    pdc.add_argument("--mountpoint", help="mountpoint path (mountpoint=...)")
+    pdc.add_argument("--canmount", choices=["on", "off", "noauto"], help="canmount property")
+    pdc.add_argument("--compression", help="compression profile (fast|balanced|max|off) or explicit value (lz4,zstd-3,...)")
+    pdc.add_argument("--atime", choices=["on", "off"], help="atime property")
+    pdc.add_argument("--recordsize", help="recordsize (e.g. 128K, 1M)")
+    pdc.add_argument("--quota", help="quota (e.g. 100G)")
+    pdc.add_argument("--refquota", help="refquota (e.g. 100G)")
+    pdc.add_argument("-o", "--property", action="append", default=[], help="extra property key=value (zfs -o)")
+    pdc.add_argument("--no-parents", action="store_true", help="do not create parent datasets (-p)")
+    pdc.set_defaults(func=cmd_ds_create)
+
+    pdl = pds.add_parser("list", help="list datasets")
+    pdl.add_argument("target", nargs="?", help="pool or dataset to list")
+    pdl.add_argument("-r", "--recursive", action="store_true", help="recursive")
+    pdl.set_defaults(func=cmd_ds_list)
+
+    pdmp = pds.add_parser("mountpoint", help="set mountpoint")
+    pdmp.add_argument("dataset")
+    pdmp.add_argument("mountpoint")
+    pdmp.add_argument("--mount-now", action="store_true", help="attempt zfs mount after setting")
+    pdmp.set_defaults(func=cmd_ds_mountpoint)
+
+    pdcmp = pds.add_parser("compression", help="set compression (profile or value)")
+    pdcmp.add_argument("dataset")
+    g = pdcmp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--profile", choices=["fast", "balanced", "max", "off"], help="predefined profile")
+    g.add_argument("--value", help="explicit value, e.g. lz4, zstd-3, gzip-6")
+    pdcmp.set_defaults(func=cmd_ds_compression)
+
+    pdp = pds.add_parser("props", help="show common properties")
+    pdp.add_argument("dataset")
+    pdp.set_defaults(func=cmd_ds_props)
+
+    pdd = pds.add_parser("destroy", help="destroy dataset (DANGEROUS)")
+    pdd.add_argument("dataset")
+    pdd.add_argument("-r", "--recursive", action="store_true")
+    pdd.add_argument("-f", "--force", action="store_true")
+    pdd.add_argument("--yes", action="store_true", help="required: really destroy it")
+    pdd.set_defaults(func=cmd_ds_destroy)
+
+    # mount/unmount shortcuts
+    pmount = sp.add_parser("mount", help="zfs mount dataset")
+    pmount.add_argument("dataset")
+    pmount.set_defaults(func=cmd_mount)
+
+    pumount = sp.add_parser("unmount", help="zfs unmount dataset")
+    pumount.add_argument("dataset")
+    pumount.add_argument("-f", "--force", action="store_true")
+    pumount.set_defaults(func=cmd_unmount)
+
+    # snapshots
+    psnap = sp.add_parser("snap", help="snapshot operations")
+    pss = psnap.add_subparsers(dest="snap_cmd", required=True)
+
+    psc = pss.add_parser("create", help="create snapshot")
+    psc.add_argument("dataset")
+    psc.add_argument("--name", help="snapshot name (default: dazfs-YYYYMMDD-HHMMSS)")
+    psc.set_defaults(func=cmd_snap_create)
+
+    psl = pss.add_parser("list", help="list snapshots")
+    psl.add_argument("dataset")
+    psl.set_defaults(func=cmd_snap_list)
+
+    psr = pss.add_parser("rollback", help="rollback to snapshot (DANGEROUS)")
+    psr.add_argument("snapshot", help="snapshot like tank/home@snapname")
+    psr.add_argument("--yes", action="store_true", help="required: really rollback")
+    psr.add_argument("-f", "--force", action="store_true")
+    psr.set_defaults(func=cmd_snap_rollback)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        warn("interrupted")
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()

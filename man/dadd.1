@@ -1,0 +1,13 @@
+.TH DADD 1 "2026-01-02" "dumbass-tree" "User Commands"
+.SH NAME
+dadd \- safer dd wrapper (write images to USB with guard rails)
+.SH SYNOPSIS
+.B dadd
+[--dry-run] [-v] <command>
+.SH COMMANDS
+.TP
+.B write <image> <device>
+Write image to block device with 1- or 2-tier confirmation.
+.TP
+.B fatimg create <path> [--size 8G]
+Create a file-backed FAT filesystem image.

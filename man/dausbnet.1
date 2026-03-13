@@ -1,0 +1,28 @@
+.TH DAUSBNET 1 "2025-12-31" "dumbass-tree" "User Commands"
+.SH NAME
+dausbnet \- USB networking helper (DHCP + sanity checks)
+.SH SYNOPSIS
+.B dausbnet
+[--dry-run] [-v] [--yes]
+.I <command>
+.SH COMMANDS
+.TP
+.B status
+Show detected USB network interfaces and basic state.
+.TP
+.B up <iface>
+Bring interface up.
+.TP
+.B down <iface>
+Bring interface down.
+.TP
+.B dhcp <iface>
+Bring interface up and try to obtain an address via DHCP.
+.TP
+.B persist
+Print or write a minimal systemd-networkd config to enable DHCP on USB ethernet.
+.SH DESCRIPTION
+dausbnet wraps common terminal steps for "why doesn't my USB ethernet / phone tethering work?".
+It can use NetworkManager (nmcli), systemd-networkd (networkctl), or a DHCP client directly.
+.SH SEE ALSO
+ip(8), nmcli(1), systemd-networkd(8), systemd.network(5), dhclient(8)

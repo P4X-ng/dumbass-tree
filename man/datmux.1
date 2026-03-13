@@ -1,0 +1,19 @@
+.TH DATMUX 1 "2026-01-02" "dumbass-tree" "User Commands"
+.SH NAME
+datmux \- tmux/screen scrollback helper (print/apply config snippets)
+.SH SYNOPSIS
+.B datmux
+[--dry-run] <command>
+.SH COMMANDS
+.TP
+.B tmux
+Print tmux scrollback snippet.
+.TP
+.B tmux --write
+Append snippet to ~/.tmux.conf (with prompt).
+.TP
+.B screen
+Print GNU screen scrollback snippet.
+.TP
+.B screen --write
+Append snippet to ~/.screenrc (with prompt).

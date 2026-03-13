@@ -1,0 +1,19 @@
+.TH DAP2P 1 "2026-01-02" "dumbass-tree" "User Commands"
+.SH NAME
+dap2p \- peer-to-peer link helpers (ethernet + USB gadget)
+.SH SYNOPSIS
+.B dap2p
+[--dry-run] [-v] <command>
+.SH COMMANDS
+.TP
+.B eth up <iface> <addr>
+Bring iface up + add static IPv4 address (two-tier warning).
+.TP
+.B gadget net
+Load g_ether (USB Ethernet gadget) on gadget-capable hardware.
+.TP
+.B gadget msd <backing_file>
+Expose file as USB mass storage (g_mass_storage).
+.TP
+.B gadget off
+Unload gadget modules (best-effort).

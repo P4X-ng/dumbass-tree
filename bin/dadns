@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""dadns - dumbass-friendly DNS sanity tool for Ubuntu-ish Linux.
+
+Why this exists:
+- systemd-resolved + NetworkManager + systemd-networkd + netplan can make DNS feel
+  like it lives in a parallel dimension.
+- /etc/resolv.conf being a symlink to a stub file (127.0.0.53) is *normal*, but it
+  hides the real upstream DNS servers unless you know where to look.
+
+This tool does 3 things:
+1) Show you the *actual* DNS in use (best-effort).
+2) Explain what your /etc/resolv.conf symlink means (stub vs real vs static).
+3) Provide safe-ish toggles with loud warnings.
+
+It does NOT try to be a full network manager.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import sys
+from typing import List
+
+from dumbasslib import (
+    confirm_or_exit,
+    confirm_two_tier_or_exit,
+    die,
+    info,
+    require_cmd,
+    require_root,
+    run,
+)
+
+
+STUB = "/run/systemd/resolve/stub-resolv.conf"
+REAL = "/run/systemd/resolve/resolv.conf"
+
+
+def _readlink(path: str) -> str | None:
+    try:
+        if os.path.islink(path):
+            return os.readlink(path)
+    except OSError:
+        return None
+    return None
+
+
+def _resolv_conf_mode() -> str:
+    # Return: "stub" | "real" | "static" | "missing" | "other"
+    p = "/etc/resolv.conf"
+    if not os.path.exists(p):
+        return "missing"
+    if os.path.islink(p):
+        target = os.path.realpath(p)
+        if target == STUB:
+            return "stub"
+        if target == REAL:
+            return "real"
+        return "other"
+    return "static"
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    mode = _resolv_conf_mode()
+    link = _readlink("/etc/resolv.conf")
+    print(f"/etc/resolv.conf mode: {mode}")
+    if link:
+        print(f"/etc/resolv.conf -> {link} (realpath: {os.path.realpath('/etc/resolv.conf')})")
+    else:
+        print("/etc/resolv.conf is a regular file")
+
+    if mode == "stub":
+        print("\nNotes:")
+        print(f"- This is the systemd-resolved *stub* file ({STUB}).")
+        print("- It will usually show: nameserver 127.0.0.53")
+        print("- That does NOT mean your upstream DNS is 127.0.0.53; it's a local stub.")
+        print("- To see the real upstream servers, use: resolvectl status")
+    elif mode == "real":
+        print("\nNotes:")
+        print(f"- This points at systemd-resolved's 'real' resolv.conf ({REAL}).")
+        print("- Traditional glibc stub clients will bypass systemd-resolved and talk directly to upstream DNS.")
+        print("- Tradeoff: you lose per-link/split-DNS semantics in classic resolv.conf format.")
+    elif mode == "static":
+        print("\nNotes:")
+        print("- This is a classic static resolv.conf file. Tools may overwrite it unless configured not to.")
+    else:
+        print("\nNotes:")
+        print("- /etc/resolv.conf is in a non-standard mode; that can be OK, but it increases mystery.")
+
+    # service statuses
+    for svc in ("systemd-resolved", "NetworkManager", "systemd-networkd"):
+        rr = run(["systemctl", "is-active", svc], check=False, capture=True)
+        st = rr.stdout.strip() or rr.stderr.strip() or f"rc={rr.returncode}"
+        print(f"{svc}: {st}")
+
+    # resolvectl (best signal)
+    if shutil_which("resolvectl"):
+        print("\nresolvectl status (actual DNS view):")
+        rr = run(["resolvectl", "status"], check=False, capture=True)
+        out = rr.stdout.strip()
+        if out:
+            print(out)
+        else:
+            print(rr.stderr.strip() or "(no output)")
+    else:
+        print("\n(resolvectl not found) Install: sudo apt install systemd-resolved")
+
+
+def shutil_which(cmd: str) -> str | None:
+    import shutil
+    return shutil.which(cmd)
+
+
+def _write_text(path: str, content: str) -> None:
+    pathlib.Path(path).write_text(content)
+
+
+def cmd_set_mode(args: argparse.Namespace) -> None:
+    require_root()
+
+    mode = args.mode
+    yes = args.yes
+    dry = args.dry_run
+
+    prompt = f"Change /etc/resolv.conf mode to: {mode}"
+    reason = "DNS config changes can break name resolution instantly, especially over SSH."
+    alternatives = [
+        "Run 'dadns status' first and understand what currently manages DNS.",
+        "Do this from a local console (not over the only SSH link you care about).",
+    ]
+
+    # Two-tier if switching away from current mode and potentially breaking
+    cur = _resolv_conf_mode()
+    if mode != cur:
+        confirm_or_exit(yes=yes, dry_run=dry, prompt=prompt, reason=reason, alternatives=alternatives)
+    else:
+        info("already in that mode (no-op)")
+        return
+
+    if mode == "stub":
+        # Ensure systemd-resolved is running; otherwise stub is useless.
+        rr = run(["systemctl", "is-active", "systemd-resolved"], check=False, capture=True)
+        if rr.returncode != 0:
+            die("systemd-resolved is not active. 'stub' mode requires it. Try: sudo systemctl unmask --now systemd-resolved")
+        run(["ln", "-sf", STUB, "/etc/resolv.conf"], dry_run=dry, verbose=args.verbose)
+        info("set /etc/resolv.conf -> stub-resolv.conf (127.0.0.53 stub)")
+    elif mode == "real":
+        # This can coexist with systemd-resolved running, but glibc clients will bypass it.
+        run(["ln", "-sf", REAL, "/etc/resolv.conf"], dry_run=dry, verbose=args.verbose)
+        info("set /etc/resolv.conf -> /run/systemd/resolve/resolv.conf (bypass stub)")
+    elif mode == "static":
+        ns: List[str] = args.nameserver or []
+        if not ns:
+            die("static mode requires at least one --nameserver (e.g. --nameserver 1.1.1.1)")
+        content = "".join(f"nameserver {x}\n" for x in ns)
+        content += "options edns0 trust-ad\n"
+        # remove symlink if present
+        if os.path.islink("/etc/resolv.conf"):
+            run(["rm", "-f", "/etc/resolv.conf"], dry_run=dry, verbose=args.verbose)
+        if not dry:
+            _write_text("/etc/resolv.conf", content)
+        info("wrote static /etc/resolv.conf")
+        print(content, end="")
+    else:
+        die(f"unknown mode: {mode}")
+
+
+def cmd_stub_listener(args: argparse.Namespace) -> None:
+    require_root()
+    on = args.on
+    yes = args.yes
+    dry = args.dry_run
+
+    prompt = f"Set systemd-resolved DNSStubListener={'yes' if on else 'no'}"
+    reason = "If you disable the stub listener but still point /etc/resolv.conf at the stub file, DNS will break."
+    alternatives = [
+        "Use 'dadns set-mode real' to bypass the stub while keeping resolved running.",
+        "Or keep stub listener on and use 'resolvectl status' to see real DNS servers.",
+    ]
+
+    confirm_or_exit(yes=yes, dry_run=dry, prompt=prompt, reason=reason, alternatives=alternatives)
+
+    # Write a drop-in instead of editing the main file.
+    drop = "/etc/systemd/resolved.conf.d/99-dumbass-tree.conf"
+    val = "yes" if on else "no"
+    text = "[Resolve]\nDNSStubListener=%s\n" % val
+
+    if not dry:
+        os.makedirs(os.path.dirname(drop), exist_ok=True)
+        pathlib.Path(drop).write_text(text)
+    info(f"wrote {drop}:\n{text.strip()}")
+
+    run(["systemctl", "restart", "systemd-resolved"], dry_run=dry, verbose=args.verbose)
+    info("restarted systemd-resolved")
+
+
+def cmd_nm_dns(args: argparse.Namespace) -> None:
+    require_root()
+    mode = args.mode
+    yes = args.yes
+    dry = args.dry_run
+
+    prompt = f"Set NetworkManager DNS plugin to: {mode}"
+    reason = "If NetworkManager expects systemd-resolved but you masked it, DNS breaks."
+    alternatives = [
+        "Use 'dadns status' to see what /etc/resolv.conf points to.",
+        "If you want to disable systemd-resolved, set NM dns=default or dns=none first.",
+    ]
+
+    confirm_or_exit(yes=yes, dry_run=dry, prompt=prompt, reason=reason, alternatives=alternatives)
+
+    drop = "/etc/NetworkManager/conf.d/99-dumbass-tree-dns.conf"
+    text = "[main]\ndns=%s\n" % mode
+
+    if not dry:
+        os.makedirs(os.path.dirname(drop), exist_ok=True)
+        pathlib.Path(drop).write_text(text)
+    info(f"wrote {drop}:\n{text.strip()}")
+
+    run(["systemctl", "restart", "NetworkManager"], dry_run=dry, verbose=args.verbose)
+    info("restarted NetworkManager")
+
+
+def cmd_flush(_: argparse.Namespace) -> None:
+    if shutil_which("resolvectl"):
+        run(["resolvectl", "flush-caches"], check=False)
+        info("flushed systemd-resolved caches")
+        return
+    die("resolvectl not found")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dadns", description=__doc__)
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--dry-run", action="store_true", help="print commands, change nothing")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="show current DNS wiring")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("set-mode", help="set /etc/resolv.conf mode: stub|real|static")
+    s.add_argument("mode", choices=["stub", "real", "static"])
+    s.add_argument("--nameserver", action="append", help="for static mode (repeatable)")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_set_mode)
+
+    s = sub.add_parser("stub-listener", help="enable/disable systemd-resolved's 127.0.0.53 stub listener")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--on", action="store_true")
+    g.add_argument("--off", dest="on", action="store_false")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_stub_listener)
+
+    s = sub.add_parser("nm-dns", help="set NetworkManager DNS plugin: systemd-resolved|default|none")
+    s.add_argument("mode", choices=["systemd-resolved", "default", "none"])
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_nm_dns)
+
+    s = sub.add_parser("flush", help="flush resolver caches (systemd-resolved)")
+    s.set_defaults(func=cmd_flush)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    p = build_parser()
+    args = p.parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

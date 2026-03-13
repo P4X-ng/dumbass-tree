@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""dathunderbolt - dumbass-friendly Thunderbolt helper (Linux).
+
+Thunderbolt is awesome *and* terrifying:
+- awesome: it's basically external PCIe
+- terrifying: it's basically external PCIe
+
+Modern Thunderbolt security modes typically require you to authorize
+devices before the OS will fully enable them.
+
+On Linux, the common userspace stack is:
+- boltd (daemon)
+- boltctl (CLI)
+
+This script is a small wrapper around boltctl with clearer hints and
+a couple of safety rails.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+_THIS = Path(__file__).resolve()
+sys.path.insert(0, str(_THIS.parent))
+
+from dumbasslib import confirm_or_exit, die, info, require_cmd, require_root, run, warn  # noqa: E402
+
+
+def _have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _read_domain_security() -> list[tuple[str, str]]:
+    """Return [(domain, security)] from sysfs if available."""
+    out: list[tuple[str, str]] = []
+    base = Path("/sys/bus/thunderbolt/devices")
+    if not base.exists():
+        return out
+    for sec in sorted(base.glob("domain*/security")):
+        try:
+            val = sec.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        out.append((sec.parent.name, val))
+    return out
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    # sysfs view
+    doms = _read_domain_security()
+    if doms:
+        info("Thunderbolt controller security (from sysfs):")
+        for d, s in doms:
+            print(f"- {d}: {s}")
+    else:
+        warn("No /sys/bus/thunderbolt/devices/domain*/security found (no controller, or kernel support missing?)")
+
+    # boltd service status (best-effort)
+    if _have("systemctl"):
+        rr = run(["systemctl", "is-active", "boltd"], capture=True, check=False, dry_run=False)
+        print(f"boltd service: {rr.stdout.strip() or 'unknown'}")
+    else:
+        warn("systemctl not found; can't check boltd service status")
+
+    if not _have("boltctl"):
+        warn("boltctl not found. Install package 'bolt' (or 'bolt-tools' on some distros).")
+        warn("Then: boltctl domains ; boltctl list")
+        return
+
+    # boltctl view (short UUIDs by default; UUIDs are sensitive-ish)
+    run(["boltctl", "-U", "short", "domains"], dry_run=args.dry_run, verbose=args.verbose, check=False)
+    run(["boltctl", "-U", "short", "list"], dry_run=args.dry_run, verbose=args.verbose, check=False)
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    require_cmd("boltctl")
+    run(["boltctl", "-U", "short", "list"], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_domains(args: argparse.Namespace) -> None:
+    require_cmd("boltctl")
+    argv = ["boltctl", "-U", "short", "domains"]
+    if args.verbose_domains:
+        argv.append("-v")
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def _confirm_trust_device(args: argparse.Namespace, action: str, uuid: str) -> None:
+    reason = (
+        "Thunderbolt devices can expose PCIe and perform high-privilege DMA-style access; "
+        "only authorize/enroll devices you physically trust"
+    )
+    alternatives = (
+        "If you don't need Thunderbolt right now: leave it unauthorized",
+        "In BIOS/UEFI, set Thunderbolt security to 'user'/'secure' (or disable TB entirely on high-security boxes)",
+        "To audit devices: dathunderbolt list ; dathunderbolt info <uuid>",
+    )
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"About to {action} Thunderbolt device {uuid}",
+        reason=reason,
+        alternatives=alternatives,
+    )
+
+
+def cmd_authorize(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmd("boltctl")
+    _confirm_trust_device(args, "authorize", args.uuid)
+    run(["boltctl", "authorize", args.uuid], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_enroll(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmd("boltctl")
+    _confirm_trust_device(args, "enroll", args.uuid)
+
+    argv = ["boltctl", "enroll"]
+    if args.policy:
+        argv += ["--policy", args.policy]
+    argv.append(args.uuid)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_forget(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmd("boltctl")
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"About to forget Thunderbolt device {args.uuid}",
+        reason="this removes the device from boltd's database (it won't auto-authorize in the future)",
+        alternatives=("If you just want to inspect: dathunderbolt info <uuid>",),
+    )
+    run(["boltctl", "forget", args.uuid], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_info(args: argparse.Namespace) -> None:
+    require_cmd("boltctl")
+    run(["boltctl", "info", args.uuid], dry_run=args.dry_run, verbose=args.verbose, check=False)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dathunderbolt", description="Thunderbolt authorization helper (boltctl wrapper)")
+    p.add_argument("--dry-run", action="store_true", help="Print actions, do not execute")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="Verbose output")
+    p.add_argument("--yes", action="store_true", help="Skip confirmation prompts")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("status", help="Show controller security, boltd status, and device list")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("list", help="List devices (including unauthorized)")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("domains", help="Show Thunderbolt domains/controllers")
+    sp.add_argument("-V", "--verbose-domains", action="store_true", help="Verbose domains output")
+    sp.set_defaults(func=cmd_domains)
+
+    sp = sub.add_parser("authorize", help="Authorize a device (temporary; does not store)")
+    sp.add_argument("uuid", help="Device UUID from boltctl list")
+    sp.set_defaults(func=cmd_authorize)
+
+    sp = sub.add_parser("enroll", help="Authorize AND remember a device (stores in boltd DB)")
+    sp.add_argument("uuid", help="Device UUID from boltctl list")
+    sp.add_argument("--policy", choices=["default", "auto", "manual"], help="Enrollment policy")
+    sp.set_defaults(func=cmd_enroll)
+
+    sp = sub.add_parser("forget", help="Forget a previously enrolled device")
+    sp.add_argument("uuid")
+    sp.set_defaults(func=cmd_forget)
+
+    sp = sub.add_parser("info", help="Show details about a device")
+    sp.add_argument("uuid")
+    sp.set_defaults(func=cmd_info)
+
+    return p
+
+
+def main(argv: list[str]) -> None:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

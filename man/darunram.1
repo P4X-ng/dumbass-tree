@@ -1,0 +1,10 @@
+.TH DARUNRAM 1 "2026-01-02" "dumbass-tree" "User Commands"
+.SH NAME
+darunram \- work in RAM then optionally sync back to disk
+.SH SYNOPSIS
+.B darunram
+[--dry-run] [-v] <command>
+.SH COMMANDS
+.TP
+.B shell <src> [--persist]
+Copy dir to /dev/shm, open a shell, optionally rsync back.

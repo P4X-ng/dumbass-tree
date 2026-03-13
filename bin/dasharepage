@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""dasharepage - capture a web page so you can share/replay it later (terminal-first).
+
+Reality check:
+- "Share the exact page I'm seeing" is hard because:
+  - JS-heavy sites fetch data after load
+  - POST requests exist
+  - sessions/cookies exist (and can leak)
+- WARC is a standard web-archive format, but replay needs a viewer.
+
+This tool provides a *safe-ish* baseline:
+- capture public pages with wget --warc-file
+- yell loudly if you try to capture authenticated/private stuff
+
+It does NOT:
+- log into sites for you
+- bypass auth
+- magically record interactive JS state
+
+But it's a solid "I need a reproducible artifact" tool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+import time
+from urllib.parse import urlparse
+
+from dumbasslib import confirm_two_tier_or_exit, info, require_cmd, run
+
+
+def _default_out_prefix(url: str) -> str:
+    u = urlparse(url)
+    host = u.netloc.replace(":", "_") or "page"
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return f"capture-{host}-{ts}"
+
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    require_cmd("wget")
+    url = args.url
+    out = args.out or _default_out_prefix(url)
+
+    # Two-tier warning because people will absolutely share cookies by accident.
+    confirm_two_tier_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"Capture URL into WARC: {url}",
+        reason="If you capture authenticated pages, you may record private data and share it by accident.",
+        alternatives=[
+            "Prefer capturing *public* URLs.",
+            "If you must capture private content, redact it and DO NOT share the raw archive.",
+        ],
+        typed="YES I WILL NOT LEAK TOKENS",
+    )
+
+    cmd = [
+        "wget",
+        "--warc-file",
+        out,
+        "--no-warc-keep-log",
+    ]
+    if args.no_compress:
+        cmd += ["--no-warc-compression"]
+    cmd += [
+        "--page-requisites",
+        "--convert-links",
+        "--adjust-extension",
+        url,
+    ]
+    run(cmd, check=False, dry_run=args.dry_run, verbose=args.verbose)
+
+    # Report likely outputs
+    candidates = []
+    for ext in (".warc.gz", ".warc"):
+        p = pathlib.Path(out + ext)
+        if p.exists():
+            candidates.append(str(p))
+    if candidates:
+        info("Created:")
+        for c in candidates:
+            print(f"  - {c}")
+    else:
+        print("(Capture finished, but output file name may differ depending on wget version.)")
+
+    print("\nReplay/view options:")
+    print("  - For raw WARC inspection: warcio (Python) or other WARC tools")
+    print("  - For browser-like replay: pywb (Python Webrecorder) or ReplayWeb.page")
+    print("\n⚠️  If you were logged in, treat the WARC as sensitive. It can include PII or session content.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dasharepage", description=__doc__)
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--dry-run", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("capture", help="capture a URL to WARC using wget")
+    s.add_argument("url")
+    s.add_argument("--out", help="output prefix (default: capture-<host>-<timestamp>)")
+    s.add_argument("--no-compress", action="store_true", help="write uncompressed .warc (bigger files)")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_capture)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

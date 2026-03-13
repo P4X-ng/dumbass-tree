@@ -1,0 +1,39 @@
+.TH DAAPPARMOR 1 "2025-12-30" "dumbass-tree" "User Commands"
+.SH NAME
+daapparmor \- dumbass-friendly AppArmor helper
+.SH SYNOPSIS
+.B daapparmor
+[\-\-dry-run] [\-v]
+.I <command>
+[\fIargs\fR]
+.SH DESCRIPTION
+daapparmor wraps common AppArmor tasks with clearer workflows and guardrails.
+It shells out to the standard AppArmor utilities like aa-status(8), aa-logprof(8),
+aa-genprof(8), aa-enforce(8), and aa-complain(8).
+.SH COMMANDS
+.TP
+.B status
+Show AppArmor status (aa-status/apparmor_status).
+.TP
+.B denials
+Show recent AppArmor DENIED messages.
+.TP
+.B allow
+Run aa-logprof to interactively add rules for recent denials.
+.TP
+.B gen \fI/executable\fR
+Run aa-genprof to generate a new profile for an executable.
+.TP
+.B enforce \fItarget...\fR
+Set profile(s) to enforce mode.
+.TP
+.B complain \fItarget...\fR
+Set profile(s) to complain mode.
+.TP
+.B disable \fItarget...\fR
+Disable profile(s).
+.TP
+.B reload
+Reload the AppArmor service (systemctl reload apparmor).
+.SH SEE ALSO
+aa-status(8), aa-logprof(8), aa-genprof(8), aa-enforce(8), aa-complain(8)

@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""daapparmor - dumbass-friendly AppArmor helper (Linux).
+
+Goal: turn "why the hell is AppArmor so annoying?" into a predictable workflow.
+
+This script does NOT attempt to magically write perfect profiles.
+Instead it wraps the *existing* AppArmor utilities (aa-logprof, aa-genprof, aa-enforce, ...)
+with nicer defaults, better hints, and a few safety rails.
+
+Key workflow (recommended):
+1) Put a profile into complain mode
+2) Exercise the app to generate denials
+3) Run 'allow' (aa-logprof) to add the minimal rules
+4) Enforce it again
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+
+# Allow imports even when this script is invoked via a symlink somewhere else.
+_THIS = Path(__file__).resolve()
+sys.path.insert(0, str(_THIS.parent))
+
+from dumbasslib import confirm_or_exit, die, require_cmd, require_cmds, require_root, run, warn  # noqa: E402
+
+
+def _have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    if _have("aa-status"):
+        run(["aa-status"], dry_run=args.dry_run, verbose=args.verbose)
+        return
+    if _have("apparmor_status"):
+        run(["apparmor_status"], dry_run=args.dry_run, verbose=args.verbose)
+        return
+    die("no aa-status/apparmor_status found (install apparmor-utils)")
+
+
+def _journalctl_supports_grep() -> bool:
+    rr = run(["journalctl", "--help"], capture=True, check=False)
+    txt = (rr.stdout or "") + (rr.stderr or "")
+    return "--grep" in txt or "\n  -g" in txt or " -g," in txt
+
+
+def cmd_denials(args: argparse.Namespace) -> None:
+    # Best effort: journald kernel messages with grep on DENIED.
+    if _have("journalctl"):
+        argv = ["journalctl", "-k", "--no-pager"]
+        if args.since:
+            argv += ["--since", args.since]
+        if args.lines:
+            argv += ["-n", str(args.lines)]
+        if args.follow:
+            argv.append("-f")
+
+        if not args.follow and _journalctl_supports_grep():
+            # Prefer server-side grep if available.
+            argv += ["-g", 'apparmor="DENIED"']
+
+        if args.follow:
+            run(argv, dry_run=args.dry_run, verbose=args.verbose)
+            return
+
+        rr = run(argv, dry_run=args.dry_run, verbose=args.verbose, capture=True, check=False)
+        if args.dry_run:
+            return
+
+        out = rr.stdout.splitlines()
+        # If grep wasn't available, filter client-side.
+        if 'apparmor="DENIED"' not in "\n".join(out):
+            out = [l for l in out if ("DENIED" in l and "apparmor" in l)]
+
+        for l in out[-args.lines :]:
+            print(l)
+        return
+
+    # Fallback: dmesg (often includes AppArmor audit lines)
+    if _have("dmesg"):
+        rr = run(["dmesg", "--color=never"], dry_run=args.dry_run, verbose=args.verbose, capture=True, check=False)
+        if args.dry_run:
+            return
+        out = [l for l in rr.stdout.splitlines() if ("DENIED" in l and "apparmor" in l)]
+        for l in out[-args.lines :]:
+            print(l)
+        return
+
+    die("no journalctl or dmesg available")
+
+
+def cmd_allow(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["aa-logprof"])
+
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt="About to run aa-logprof (interactive) to update AppArmor profiles based on logged denials.",
+        reason="This modifies security policy. You should review the suggested rules instead of blindly allowing everything.",
+        alternatives=[
+            "View recent denials first: daapparmor denials --since 1h",
+            "Put a profile in complain mode while testing: daapparmor complain <profile>",
+            "Generate a NEW profile for an executable: daapparmor gen /path/to/app",
+        ],
+    )
+
+    argv = ["aa-logprof"]
+    if args.logfile:
+        argv += ["-f", args.logfile]
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_gen(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["aa-genprof"])
+    run(["aa-genprof", args.executable], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_mode(args: argparse.Namespace) -> None:
+    require_root()
+    if args.mode == "enforce":
+        require_cmds(["aa-enforce"])
+        run(["aa-enforce", *args.targets], dry_run=args.dry_run, verbose=args.verbose)
+        return
+    if args.mode == "complain":
+        require_cmds(["aa-complain"])
+        run(["aa-complain", *args.targets], dry_run=args.dry_run, verbose=args.verbose)
+        return
+    if args.mode == "disable":
+        require_cmds(["aa-disable"])
+        run(["aa-disable", *args.targets], dry_run=args.dry_run, verbose=args.verbose)
+        return
+    die(f"unknown mode: {args.mode}")
+
+
+def cmd_reload(args: argparse.Namespace) -> None:
+    require_root()
+    # Best-effort: systemd, then service.
+    if _have("systemctl"):
+        rr = run(["systemctl", "reload", "apparmor"], dry_run=args.dry_run, verbose=args.verbose, check=False)
+        if args.dry_run:
+            return
+        if rr.returncode == 0:
+            return
+        warn("systemctl reload apparmor failed; trying restart")
+        run(["systemctl", "restart", "apparmor"], dry_run=args.dry_run, verbose=args.verbose)
+        return
+    if _have("service"):
+        run(["service", "apparmor", "reload"], dry_run=args.dry_run, verbose=args.verbose, check=False)
+        return
+    warn("no systemctl/service found; you may need to reload profiles manually")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="daapparmor", description="dumbass-friendly AppArmor helper")
+    p.add_argument("--dry-run", action="store_true", help="print commands instead of executing them")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="increase verbosity")
+
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    ps = sp.add_parser("status", help="show AppArmor status (aa-status)")
+    ps.set_defaults(func=cmd_status)
+
+    pd = sp.add_parser("denials", help="show recent AppArmor DENIED messages")
+    pd.add_argument("--since", default="1h", help='journalctl --since value (e.g. "10m", "1h", "today")')
+    pd.add_argument("-n", "--lines", type=int, default=50, help="number of lines to show")
+    pd.add_argument("-f", "--follow", action="store_true", help="follow live denials (journalctl -f)")
+    pd.set_defaults(func=cmd_denials)
+
+    pa = sp.add_parser("allow", help="run aa-logprof to add rules for recent denials")
+    pa.add_argument("--logfile", help="explicit logfile (aa-logprof -f <file>)")
+    pa.add_argument("--yes", action="store_true", help="skip confirmation prompt")
+    pa.set_defaults(func=cmd_allow)
+
+    pg = sp.add_parser("gen", help="run aa-genprof to generate a new profile for an executable")
+    pg.add_argument("executable", help="path to executable, e.g. /usr/bin/nginx")
+    pg.set_defaults(func=cmd_gen)
+
+    pm = sp.add_parser("enforce", help="set one or more profiles to enforce mode (aa-enforce)")
+    pm.add_argument("targets", nargs="+", help="profile names or /etc/apparmor.d/* files")
+    pm.set_defaults(func=lambda a: cmd_mode(argparse.Namespace(**vars(a), mode="enforce")))
+
+    pmc = sp.add_parser("complain", help="set one or more profiles to complain mode (aa-complain)")
+    pmc.add_argument("targets", nargs="+", help="profile names or /etc/apparmor.d/* files")
+    pmc.set_defaults(func=lambda a: cmd_mode(argparse.Namespace(**vars(a), mode="complain")))
+
+    pmd = sp.add_parser("disable", help="disable one or more profiles (aa-disable)")
+    pmd.add_argument("targets", nargs="+", help="profile names or /etc/apparmor.d/* files")
+    pmd.set_defaults(func=lambda a: cmd_mode(argparse.Namespace(**vars(a), mode="disable")))
+
+    pr = sp.add_parser("reload", help="reload AppArmor service (systemctl reload apparmor)")
+    pr.set_defaults(func=cmd_reload)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        warn("interrupted")
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()

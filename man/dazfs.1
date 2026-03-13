@@ -1,0 +1,90 @@
+.TH DAZFS 1 "2025-12-30" "dumbass-tree" "User Commands"
+.SH NAME
+dazfs \- dumbass-friendly ZFS helper
+.SH SYNOPSIS
+.B dazfs
+[\-\-dry-run] [\-\-verbose]
+.I <command>
+.I <subcommand>
+[\fIargs\fR]
+.SH DESCRIPTION
+dazfs wraps common ZFS operations with safer defaults and a predictable CLI.
+It shells out to zpool(8) and zfs(8).
+.SH GLOBAL OPTIONS
+.TP
+.BR \-\-dry-run
+Print commands instead of executing them.
+.TP
+.BR \-v ", " \-\-verbose
+More output (repeatable).
+.SH COMMANDS
+.SS status
+Show zpool status and zfs list.
+.PP
+.B dazfs status
+[\-\-pool \fIname\fR]
+.SS explain
+Quick explanations of common ZFS terms.
+.PP
+.B dazfs explain
+\fIdataset|pool|vdev|mountpoint|canmount|compression|onefs\fR
+.SS tree
+Create a dataset hierarchy that *looks like one filesystem tree* by mounting datasets under one root.
+This is usually what people mean by "merge" in ZFS.
+.PP
+.B dazfs tree init
+\fIpool\fR [\-\-root \fI/path\fR] [\-\-style \fIvault|minimal|nas\fR] [\-\-compression \fIprofile\fR] [\-\-mount-now]
+.PP
+If the pool already has a different mountpoint, changing it requires \fB\-\-yes\fR.
+.SS pool
+Pool operations.
+.TP
+.B dazfs pool create \fIname\fR \fIdevices...\fR [\-\-yes]
+Create a pool. Prompts before running unless \fB\-\-yes\fR is provided.
+.TP
+.B dazfs pool list
+Show pools (zpool list).
+.TP
+.B dazfs pool scrub \fIname\fR
+Start a scrub.
+.TP
+.B dazfs pool add \fIname\fR \fIdevices...\fR \-\-yes
+Add a vdev to a pool (irreversible; can change redundancy).
+.TP
+.B dazfs pool attach \fIname\fR \fIexisting\fR \fInew\fR \-\-yes
+Attach a new disk to an existing vdev (often used to turn a single disk into a mirror).
+.TP
+.B dazfs pool destroy \fIname\fR \-\-yes
+Destroy a pool (DANGEROUS).
+.SS ds
+Dataset operations.
+.TP
+.B dazfs ds create \fIname\fR
+Create a filesystem dataset (zfs create).
+.TP
+.B dazfs ds list [\fItarget\fR]
+List datasets.
+.TP
+.B dazfs ds mountpoint \fIdataset\fR \fI/path\fR
+Set mountpoint property.
+.TP
+.B dazfs ds compression \fIdataset\fR \-\-profile fast|balanced|max|off
+Set compression to a sane value (with fallbacks).
+.TP
+.B dazfs ds destroy \fIdataset\fR \-\-yes
+Destroy dataset (DANGEROUS).
+.SS snap
+Snapshot operations.
+.TP
+.B dazfs snap create \fIdataset\fR
+Create snapshot (default name is timestamped).
+.TP
+.B dazfs snap list \fIdataset\fR
+List snapshots below dataset.
+.TP
+.B dazfs snap rollback \fIdataset@snap\fR \-\-yes
+Rollback (DANGEROUS).
+.SH FILES
+See docs in dumbass-tree/docs/.
+.SH SEE ALSO
+zpool(8), zfs(8)

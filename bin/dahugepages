@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""dahugepages - dumbass-friendly hugepages helper (Linux).
+
+What it does:
+- `status`: show hugepage counts + THP mode
+- `alloc/free`: reserve hugetlb hugepages via /sys/kernel/mm/hugepages/.../nr_hugepages
+- `mount`: mount hugetlbfs at a mountpoint (optionally with pagesize/mode/gid)
+- `thp`: show or set Transparent Huge Pages mode
+- `persist`: print example sysctl/fstab lines
+
+This script is Linux-specific.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+_THIS = Path(__file__).resolve()
+sys.path.insert(0, str(_THIS.parent))
+
+from dumbasslib import die, format_size_kib, info, parse_kib_size, require_cmd, require_root, run, warn  # noqa: E402
+
+
+SYSFS_HUGEPAGES = Path("/sys/kernel/mm/hugepages")
+SYSFS_THP = Path("/sys/kernel/mm/transparent_hugepage")
+
+
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _read_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _write_text(p: Path, data: str, *, dry_run: bool, verbose: int) -> None:
+    if dry_run or verbose > 0:
+        print(f"$ echo {data.strip()} > {p}", file=sys.stderr)
+    if dry_run:
+        return
+    try:
+        p.write_text(data, encoding="utf-8")
+    except PermissionError:
+        die(f"permission denied writing {p} (try: sudo ...)")
+    except FileNotFoundError:
+        die(f"missing sysfs path: {p}")
+
+
+def _list_hugepage_dirs() -> list[Path]:
+    if not SYSFS_HUGEPAGES.is_dir():
+        return []
+    out = []
+    for child in sorted(SYSFS_HUGEPAGES.iterdir()):
+        if child.is_dir() and child.name.startswith("hugepages-") and child.name.endswith("kB"):
+            out.append(child)
+    return out
+
+
+def _dir_for_size(size: str) -> Path:
+    kib = parse_kib_size(size)
+    d = SYSFS_HUGEPAGES / f"hugepages-{kib}kB"
+    if not d.is_dir():
+        die(f"hugepage size not available: {size} (expected sysfs dir {d})")
+    return d
+
+
+def _parse_meminfo() -> dict[str, str]:
+    meminfo = {}
+    text = _read_text(Path("/proc/meminfo"))
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        meminfo[k.strip()] = v.strip()
+    return meminfo
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    if not _is_linux():
+        die("dahugepages is Linux-only")
+
+    mem = _parse_meminfo()
+
+    print("== /proc/meminfo ==")
+    keys = [
+        "HugePages_Total",
+        "HugePages_Free",
+        "HugePages_Rsvd",
+        "HugePages_Surp",
+        "Hugepagesize",
+        "AnonHugePages",
+        "ShmemHugePages",
+        "FileHugePages",
+    ]
+    for k in keys:
+        if k in mem:
+            print(f"{k:16} {mem[k]}")
+
+    print("\n== sysfs hugepages ==")
+    dirs = _list_hugepage_dirs()
+    if not dirs:
+        print("(no /sys/kernel/mm/hugepages entries found)")
+    for d in dirs:
+        size_match = re.search(r"hugepages-(\d+)kB", d.name)
+        kib = int(size_match.group(1)) if size_match else None
+        size_str = format_size_kib(kib) if kib is not None else d.name
+        nr = _read_text(d / "nr_hugepages").strip()
+        free = _read_text(d / "free_hugepages").strip()
+        rsvd = _read_text(d / "resv_hugepages").strip()
+        surp = _read_text(d / "surplus_hugepages").strip()
+        print(f"{size_str:6}  nr={nr:>8}  free={free:>8}  rsvd={rsvd:>8}  surp={surp:>8}")
+
+    print("\n== THP (Transparent Huge Pages) ==")
+    enabled = _read_text(SYSFS_THP / "enabled").strip()
+    defrag = _read_text(SYSFS_THP / "defrag").strip()
+    if enabled:
+        print(f"enabled: {enabled}")
+    else:
+        print("(no THP sysfs found)")
+    if defrag:
+        print(f"defrag:  {defrag}")
+
+    print("\n== hugetlbfs mounts ==")
+    mounts = _read_text(Path("/proc/mounts"))
+    lines = [ln for ln in mounts.splitlines() if " hugetlbfs " in ln]
+    if not lines:
+        print("(no hugetlbfs mounts)")
+    else:
+        for ln in lines:
+            print(ln)
+
+
+def cmd_alloc(args: argparse.Namespace) -> None:
+    if not _is_linux():
+        die("dahugepages is Linux-only")
+    require_root()
+
+    d = _dir_for_size(args.size)
+    target = d / "nr_hugepages"
+    _write_text(target, str(args.count) + "\n", dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_free(args: argparse.Namespace) -> None:
+    if not _is_linux():
+        die("dahugepages is Linux-only")
+    require_root()
+
+    d = _dir_for_size(args.size)
+    target = d / "nr_hugepages"
+    _write_text(target, "0\n", dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_mount(args: argparse.Namespace) -> None:
+    if not _is_linux():
+        die("dahugepages is Linux-only")
+    require_root()
+    require_cmd("mount")
+
+    mp = Path(args.mountpoint)
+    if not mp.exists():
+        if args.dry_run or args.verbose > 0:
+            print(f"$ mkdir -p {mp}", file=sys.stderr)
+        if not args.dry_run:
+            mp.mkdir(parents=True, exist_ok=True)
+
+    opts = []
+    if args.size:
+        opts.append(f"pagesize={args.size}")
+    if args.mode:
+        # mode is octal string
+        opts.append(f"mode={args.mode}")
+    if args.gid is not None:
+        opts.append(f"gid={args.gid}")
+
+    argv = ["mount", "-t", "hugetlbfs"]
+    if opts:
+        argv += ["-o", ",".join(opts)]
+    argv += ["none", str(mp)]
+
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def _thp_current() -> str:
+    text = _read_text(SYSFS_THP / "enabled")
+    # Format is like: "always [madvise] never"
+    m = re.search(r"\[(always|madvise|never)\]", text)
+    return m.group(1) if m else ""
+
+
+def cmd_thp(args: argparse.Namespace) -> None:
+    if not _is_linux():
+        die("dahugepages is Linux-only")
+
+    if args.set is None:
+        cur = _thp_current()
+        if not cur:
+            die("could not read THP mode (missing /sys/kernel/mm/transparent_hugepage/enabled?)")
+        print(cur)
+        return
+
+    require_root()
+    mode = args.set
+    if mode not in {"always", "madvise", "never"}:
+        die("THP mode must be: always | madvise | never")
+
+    target = SYSFS_THP / "enabled"
+    _write_text(target, mode + "\n", dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_persist(args: argparse.Namespace) -> None:
+    if not _is_linux():
+        die("dahugepages is Linux-only")
+
+    size = args.size
+    count = args.count
+    mp = args.mountpoint
+    mode = args.mode
+    gid = args.gid
+
+    print("== sysctl example ==")
+    if size.lower() in {"2m", "2048kb", "2048k"}:
+        print("# /etc/sysctl.d/90-hugepages.conf")
+        print(f"vm.nr_hugepages = {count}")
+    else:
+        print("# vm.nr_hugepages controls the *default* hugepage size (often 2M).")
+        print("# For 1G hugepages you usually reserve at boot, e.g. kernel cmdline:")
+        print(f"#   hugepagesz={size} hugepages={count}")
+        print("# Or use a systemd service that writes to /sys/kernel/mm/hugepages/.../nr_hugepages early in boot.")
+
+    print("\n== fstab example ==")
+    opts = []
+    if size:
+        opts.append(f"pagesize={size}")
+    if mode:
+        opts.append(f"mode={mode}")
+    if gid is not None:
+        opts.append(f"gid={gid}")
+    opt_str = ",".join(opts) if opts else "defaults"
+
+    print("# /etc/fstab")
+    print(f"none {mp} hugetlbfs {opt_str} 0 0")
+
+    print("\n== systemd example (very rough) ==")
+    print("# If you need to allocate hugepages very early:")
+    print("#   ExecStart=/bin/sh -c 'echo <count> > /sys/kernel/mm/hugepages/hugepages-<kB>/nr_hugepages'")
+
+    print("\nNote: this repo does not edit system config automatically; it just prints templates.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dahugepages", description="dumbass-friendly hugepages helper (Linux)")
+    p.add_argument("--dry-run", action="store_true", help="print actions instead of executing")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="more output (repeatable)")
+
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    ps = sp.add_parser("status", help="show hugepages + THP status")
+    ps.set_defaults(func=cmd_status)
+
+    pa = sp.add_parser("alloc", help="reserve hugetlb hugepages (requires root)")
+    pa.add_argument("--size", default="2M", help="hugepage size (2M or 1G)")
+    pa.add_argument("--count", type=int, required=True, help="number of hugepages to reserve")
+    pa.set_defaults(func=cmd_alloc)
+
+    pf = sp.add_parser("free", help="free reserved hugepages of a given size (requires root)")
+    pf.add_argument("--size", default="2M", help="hugepage size (2M or 1G)")
+    pf.set_defaults(func=cmd_free)
+
+    pm = sp.add_parser("mount", help="mount hugetlbfs (requires root)")
+    pm.add_argument("mountpoint", help="where to mount hugetlbfs")
+    pm.add_argument("--size", default="2M", help="pagesize mount option (2M or 1G)")
+    pm.add_argument("--mode", help="permissions mode (octal), e.g. 1770")
+    pm.add_argument("--gid", type=int, help="group id owning the mount")
+    pm.set_defaults(func=cmd_mount)
+
+    pt = sp.add_parser("thp", help="show or set Transparent Huge Pages mode")
+    pt.add_argument("--set", choices=["always", "madvise", "never"], help="set THP mode (requires root)")
+    pt.set_defaults(func=cmd_thp)
+
+    pp = sp.add_parser("persist", help="print persistence templates (sysctl + fstab)")
+    pp.add_argument("--size", default="2M")
+    pp.add_argument("--count", type=int, default=0)
+    pp.add_argument("--mountpoint", default="/mnt/huge")
+    pp.add_argument("--mode", default="1770")
+    pp.add_argument("--gid", type=int, default=None)
+    pp.set_defaults(func=cmd_persist)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        warn("interrupted")
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()

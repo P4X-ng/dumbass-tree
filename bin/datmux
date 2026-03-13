@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""datmux - tmux/screen scrollback that doesn't feel like a puzzle box.
+
+You asked for "normal people scrollback".
+This tool prints sane config snippets for:
+- tmux: keep a big history buffer + mouse scroll to copy-mode
+- GNU screen: set defscrollback + (optional) disable alternate-screen behavior
+
+It can also append to ~/.tmux.conf or ~/.screenrc (with --write).
+
+This is intentionally not clever. It's a reminder tool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import sys
+
+from dumbasslib import confirm_or_exit, info
+
+
+TMUX_SNIPPET = r"""# dumbass-tree: sane tmux scrollback
+set -g history-limit 100000
+set -g mouse on
+
+# When you scroll up, enter copy-mode automatically (so scrollback works like you'd expect)
+bind -n WheelUpPane if -F '#{mouse_any_flag}' 'send-keys -M' 'copy-mode -e; send-keys -M'
+"""
+
+SCREEN_SNIPPET = r"""# dumbass-tree: sane GNU screen scrollback
+defscrollback 10000
+
+# Optional: keep your terminal's scrollback when full-screen apps exit.
+# This can break some full-screen programs depending on TERM/terminal.
+# termcapinfo xterm* ti@:te@
+"""
+
+
+def _append(path: pathlib.Path, text: str) -> None:
+    if path.exists():
+        existing = path.read_text(errors="ignore")
+        if "dumbass-tree: sane" in existing:
+            info(f"{path} already contains dumbass-tree snippet (no-op)")
+            return
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n" + text + "\n")
+    info(f"appended to {path}")
+
+
+def cmd_tmux(args: argparse.Namespace) -> None:
+    if args.write:
+        path = pathlib.Path(os.path.expanduser("~/.tmux.conf"))
+        confirm_or_exit(
+            yes=args.yes,
+            dry_run=args.dry_run,
+            prompt=f"Append dumbass-tree scrollback snippet to {path}?",
+            reason="You might have custom keybinds; this will add bindings that could conflict.",
+            alternatives=["Run without --write and paste it manually."],
+        )
+        if not args.dry_run:
+            _append(path, TMUX_SNIPPET)
+    else:
+        print(TMUX_SNIPPET)
+
+
+def cmd_screen(args: argparse.Namespace) -> None:
+    if args.write:
+        path = pathlib.Path(os.path.expanduser("~/.screenrc"))
+        confirm_or_exit(
+            yes=args.yes,
+            dry_run=args.dry_run,
+            prompt=f"Append dumbass-tree scrollback snippet to {path}?",
+            reason="You might have custom screen config; this will add defaults that could conflict.",
+            alternatives=["Run without --write and paste it manually."],
+        )
+        if not args.dry_run:
+            _append(path, SCREEN_SNIPPET)
+    else:
+        print(SCREEN_SNIPPET)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="datmux", description=__doc__)
+    p.add_argument("--dry-run", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("tmux", help="print/apply tmux scrollback snippet")
+    s.add_argument("--write", action="store_true")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_tmux)
+
+    s = sub.add_parser("screen", help="print/apply GNU screen scrollback snippet")
+    s.add_argument("--write", action="store_true")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_screen)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

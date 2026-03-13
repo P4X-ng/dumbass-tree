@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""dadd - dd, but with guard rails and less foot-guns.
+
+Because yes, "dd" stands for:
+    disk destroyer
+
+Features:
+- safer 'write image -> device' flow with 2-tier confirmations
+- smart warnings if you target a partition (/dev/sdX1) instead of the whole device (/dev/sdX)
+- optional wipefs before writing (helps with old signatures)
+- fatimg: create a file-backed FAT volume (useful for USB gadget mass storage)
+
+This is not meant to be a full imaging suite.
+It's the 90% cases where you just want an ISO on a USB stick *without* nuking your OS disk.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from dumbasslib import (
+    confirm_or_exit,
+    confirm_two_tier_or_exit,
+    die,
+    format_size_kib,
+    info,
+    require_cmds,
+    require_root,
+    run,
+)
+
+
+def _is_block(path: str) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return stat.S_ISBLK(st.st_mode)
+
+
+def _lsblk_json(dev: str) -> Dict[str, Any] | None:
+    rr = run(["lsblk", "-J", "-o", "NAME,TYPE,SIZE,RM,MOUNTPOINTS,PKNAME,PATH,MODEL,SERIAL", dev], capture=True, check=False)
+    if rr.returncode != 0 or not rr.stdout.strip():
+        return None
+    try:
+        return json.loads(rr.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+@dataclass
+class DevInfo:
+    path: str
+    type: str = ""
+    rm: Optional[bool] = None
+    size: str = ""
+    model: str = ""
+    mountpoints: List[str] = None
+    pkname: str = ""  # parent disk name
+
+    def __post_init__(self) -> None:
+        if self.mountpoints is None:
+            self.mountpoints = []
+
+
+def _flatten_lsblk_tree(node: Dict[str, Any], out: List[Dict[str, Any]]) -> None:
+    out.append(node)
+    for ch in node.get("children", []) or []:
+        _flatten_lsblk_tree(ch, out)
+
+
+def get_devinfo(dev: str) -> DevInfo:
+    di = DevInfo(path=dev)
+    data = _lsblk_json(dev)
+    if not data:
+        return di
+    blocks = data.get("blockdevices", []) or []
+    flat: List[Dict[str, Any]] = []
+    for b in blocks:
+        _flatten_lsblk_tree(b, flat)
+    # Find the exact PATH match if present, else first blockdevice
+    match = None
+    for x in flat:
+        if x.get("path") == dev:
+            match = x
+            break
+    if match is None and blocks:
+        match = blocks[0]
+    if not match:
+        return di
+    di.type = str(match.get("type") or "")
+    rm = match.get("rm")
+    if rm is not None:
+        di.rm = bool(int(rm)) if isinstance(rm, (int, str)) else bool(rm)
+    di.size = str(match.get("size") or "")
+    di.model = str(match.get("model") or "")
+    mps = match.get("mountpoints") or []
+    if isinstance(mps, list):
+        di.mountpoints = [str(m) for m in mps if m]
+    di.pkname = str(match.get("pkname") or "")
+    return di
+
+
+def _root_source() -> str | None:
+    rr = run(["findmnt", "-n", "-o", "SOURCE", "/"], capture=True, check=False)
+    out = rr.stdout.strip()
+    return out or None
+
+
+def _maybe_base_disk(dev: str) -> str:
+    # crude: /dev/sda1 -> /dev/sda ; /dev/nvme0n1p2 -> /dev/nvme0n1
+    b = os.path.basename(dev)
+    m = re.match(r"^(nvme\d+n\d+)", b)
+    if m:
+        return "/dev/" + m.group(1)
+    m2 = re.match(r"^([a-z]+)\d+$", b)
+    if m2:
+        return "/dev/" + m2.group(1)
+    return dev
+
+
+def _tier_for_target(dev: str, di: DevInfo) -> int:
+    # 2 = red alert (two-tier typed phrase)
+    # 1 = normal confirm
+    # Determine risk:
+    # - non-removable disk
+    # - mounted filesystems present
+    # - matches root disk
+    root = _root_source()
+    base = _maybe_base_disk(dev)
+    if root and (root == dev or root.startswith(base)):
+        return 2
+    if di.mountpoints:
+        return 2
+    if di.rm is False:
+        return 2
+    return 1
+
+
+def _print_dev_summary(di: DevInfo) -> None:
+    print("Target:")
+    print(f"  path: {di.path}")
+    if di.type:
+        print(f"  type: {di.type}")
+    if di.size:
+        print(f"  size: {di.size}")
+    if di.model:
+        print(f"  model: {di.model}")
+    if di.rm is not None:
+        print(f"  removable: {di.rm}")
+    if di.mountpoints:
+        print(f"  mountpoints: {', '.join(di.mountpoints)}")
+    if di.pkname:
+        print(f"  parent disk: {di.pkname}")
+
+
+def cmd_write(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["dd", "lsblk", "sync"])
+
+    img = args.image
+    dev = args.device
+
+    if not os.path.exists(img):
+        die(f"image not found: {img}")
+    if not os.path.exists(dev):
+        die(f"device not found: {dev}")
+    if not _is_block(dev):
+        die(f"not a block device: {dev}")
+
+    di = get_devinfo(dev)
+    _print_dev_summary(di)
+
+    # warn if they passed a partition
+    if di.type == "part" or re.search(r"\d$", dev):
+        print("\n⚠️  That looks like a PARTITION, not a whole disk.")
+        print("Bootable USB imaging usually wants the whole disk (e.g. /dev/sdb), not /dev/sdb1.")
+        if not args.force_partition:
+            die("Refusing by default. Re-run with --force-partition if you really mean it.")
+
+    # compute image size
+    img_sz = os.stat(img).st_size
+    print(f"\nImage: {img} ({img_sz} bytes)")
+
+    reason = "dd will overwrite the target device byte-for-byte. There is no undo."
+    alternatives = [
+        "Use lsblk -f and double-check the target.",
+        "Unplug other removable drives so you can't pick the wrong one.",
+        "If you need a GUI, use a tool like Etcher (but this repo is about terminals, so... yeah).",
+    ]
+
+    tier = _tier_for_target(dev, di)
+    if tier >= 2:
+        confirm_two_tier_or_exit(
+            yes=args.yes,
+            dry_run=args.dry_run,
+            prompt=f"WRITE IMAGE -> {dev}",
+            reason=reason,
+            alternatives=alternatives,
+            typed=f"YES NUKE {dev}",
+        )
+    else:
+        confirm_or_exit(
+            yes=args.yes,
+            dry_run=args.dry_run,
+            prompt=f"Write {img} to {dev}?",
+            reason=reason,
+            alternatives=alternatives,
+        )
+
+    # unmount if mounted
+    if di.mountpoints:
+        info("unmounting mounted filesystems on target (best-effort)")
+        run(["umount", "-f", dev], check=False, dry_run=args.dry_run, verbose=args.verbose)
+
+    if args.wipefs:
+        require_cmds(["wipefs"])
+        info("wiping old filesystem signatures (wipefs -a)")
+        run(["wipefs", "-a", dev], dry_run=args.dry_run, verbose=args.verbose)
+
+    bs = args.bs
+    dd_cmd = ["dd", f"if={img}", f"of={dev}", f"bs={bs}", "status=progress", "conv=fsync"]
+    info("writing...")
+    run(dd_cmd, dry_run=args.dry_run, verbose=args.verbose)
+    run(["sync"], dry_run=args.dry_run, verbose=args.verbose)
+    info("done. Safely eject the USB drive before pulling it.")
+
+
+def _parse_size_bytes(s: str) -> int:
+    # accept 8G, 1024M, 4096K, or raw bytes
+    st = s.strip().lower()
+    mult = 1
+    if st.endswith("k"):
+        mult = 1024
+        st = st[:-1]
+    elif st.endswith("m"):
+        mult = 1024 ** 2
+        st = st[:-1]
+    elif st.endswith("g"):
+        mult = 1024 ** 3
+        st = st[:-1]
+    try:
+        return int(st) * mult
+    except ValueError:
+        die(f"invalid size: {s} (try 8G, 1024M, 4096K)")
+
+
+def cmd_fatimg_create(args: argparse.Namespace) -> None:
+    require_cmds(["fallocate", "mkfs.vfat"])
+    path = args.path
+    size = _parse_size_bytes(args.size)
+    label = args.label
+
+    if os.path.exists(path) and not args.force:
+        die(f"{path} exists. Re-run with --force to overwrite.")
+    if os.path.isdir(path):
+        die(f"{path} is a directory")
+
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"Create FAT image file {path} size={args.size}",
+        reason="This overwrites the destination file if it exists.",
+        alternatives=["Pick a new path or omit --force."],
+    )
+
+    if not args.dry_run:
+        # create/resize file
+        run(["fallocate", "-l", str(size), path], dry_run=False, verbose=args.verbose)
+        # format
+        cmd = ["mkfs.vfat"]
+        if label:
+            cmd += ["-n", label]
+        cmd += [path]
+        run(cmd, dry_run=False, verbose=args.verbose)
+    info("created FAT image. You can export it via USB gadget mass storage:")
+    print(f"  sudo dap2p gadget msd {path}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dadd", description=__doc__)
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--dry-run", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("write", help="write an image file to a block device (bootable USB, etc)")
+    s.add_argument("image")
+    s.add_argument("device")
+    s.add_argument("--bs", default="4M", help="dd block size (default: 4M)")
+    s.add_argument("--no-wipefs", dest="wipefs", action="store_false", help="skip wipefs -a")
+    s.add_argument("--wipefs", dest="wipefs", action="store_true", help="run wipefs -a before dd (default)")
+    s.set_defaults(wipefs=True)
+    s.add_argument("--force-partition", action="store_true", help="allow writing to /dev/sdX1 (usually a mistake)")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_write)
+
+    fat = sub.add_parser("fatimg", help="file-backed FAT images (useful for USB gadget mass storage)")
+    fat_sub = fat.add_subparsers(dest="fat_cmd", required=True)
+
+    c = fat_sub.add_parser("create", help="create a FAT filesystem inside a file")
+    c.add_argument("path")
+    c.add_argument("--size", default="8G", help="size like 8G/1024M (default: 8G)")
+    c.add_argument("--label", default="DUMBASS", help="FAT volume label")
+    c.add_argument("--force", action="store_true", help="overwrite if exists")
+    c.add_argument("--yes", action="store_true")
+    c.set_defaults(func=cmd_fatimg_create)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

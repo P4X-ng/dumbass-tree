@@ -1,0 +1,35 @@
+.TH DAHUGEPAGES 1 "2025-12-29" "dumbass-tree" "User Commands"
+.SH NAME
+dahugepages \- dumbass-friendly hugepages helper (Linux)
+.SH SYNOPSIS
+.B dahugepages
+[\-\-dry-run] [\-\-verbose]
+.I <command>
+[\fIargs\fR]
+.SH DESCRIPTION
+dahugepages inspects and configures Linux hugepages (hugetlb) and THP.
+It reads /proc/meminfo and /sys and shells out to mount(8) when needed.
+.SH COMMANDS
+.TP
+.B dahugepages status
+Show hugepage + THP status.
+.TP
+.B dahugepages alloc \-\-size 2M|1G \-\-count N
+Reserve hugepages of a given size (requires root).
+.TP
+.B dahugepages free \-\-size 2M|1G
+Free reserved hugepages (set count to 0, requires root).
+.TP
+.B dahugepages mount \fImountpoint\fR [\-\-size 2M|1G] [\-\-mode OCTAL] [\-\-gid GID]
+Mount hugetlbfs (requires root).
+.TP
+.B dahugepages thp
+Print THP mode.
+.TP
+.B dahugepages thp \-\-set always|madvise|never
+Set THP mode (requires root).
+.TP
+.B dahugepages persist ...
+Print example sysctl and fstab lines for persistence.
+.SH SEE ALSO
+Documentation in dumbass-tree/docs/hugepages-for-dummies.md.

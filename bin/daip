@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""daip - iproute2 for humans (but still terminal nerds).
+
+iproute2 is powerful and also loves to speak in arcane adjectives:
+  "scope global dynamic noprefixroute"
+  "master br0"
+  "<BROADCAST,MULTICAST,UP,LOWER_UP>"
+
+This tool gives you:
+- brief status views (without 900 lines)
+- an "explain" mode for common flags/words
+- reminders for the 90% most-used ip commands
+
+It doesn't replace 'man ip' — it just makes 'ip' less of a jump-scare.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from dumbasslib import die, run
+
+
+TOKENS = {
+    # address attributes
+    "scope": "Routing scope. Common: 'host' (only local), 'link' (same L2), 'global' (routable).",
+    "global": "Global-scope address (routable, not just link-local).",
+    "link": "Link-scope (usually link-local, usable only on the same L2 segment).",
+    "host": "Host-scope (loopback-ish, only local).",
+    "dynamic": "Dynamic address (often from DHCP or SLAAC), not manually configured.",
+    "temporary": "IPv6 temporary privacy address.",
+    "deprecated": "Address is deprecated; may still work, but shouldn't be used for new connections.",
+    "tentative": "IPv6 DAD in progress (Duplicate Address Detection).",
+    "dadfailed": "IPv6 DAD failed (duplicate detected).",
+    "noprefixroute": "Kernel will not auto-add a connected route for this prefix.",
+    "secondary": "Secondary address on the interface (legacy label).",
+    "primary": "Primary address on the interface (legacy label).",
+    "metric": "Route metric (lower = preferred).",
+    "proto": "Protocol/source of a route (kernel, dhcp, static, ra, etc.).",
+
+    # link flags
+    "up": "Interface is administratively UP (ip link set dev X up).",
+    "down": "Interface is administratively DOWN.",
+    "lower_up": "Link is physically up (carrier detected).",
+    "no-carrier": "No link detected (cable unplugged / no RF link).",
+    "broadcast": "Supports broadcast (Ethernet-like).",
+    "multicast": "Supports multicast (most Ethernet/Wi-Fi).",
+
+    # master/slave
+    "master": "This interface is enslaved to a master device (bridge/bond/team).",
+    "bridge": "Bridge device (L2 switch in software).",
+    "bond": "Bond/team device (L2/L3 aggregation/failover).",
+    "vrf": "VRF master (separate routing table domain).",
+}
+
+
+def cmd_brief(_: argparse.Namespace) -> None:
+    rr = run(["ip", "-br", "addr"], capture=True, check=False)
+    if rr.returncode != 0:
+        die(rr.stderr.strip() or "ip failed")
+    print(rr.stdout.strip())
+    print("\nRoutes (main table):")
+    rr2 = run(["ip", "-br", "route", "show"], capture=True, check=False)
+    print(rr2.stdout.strip())
+
+
+def cmd_cheat(_: argparse.Namespace) -> None:
+    print(
+        """iproute2 cheat sheet (the 90% set)
+
+# Interfaces
+ip -br link
+ip link set dev IFACE up
+ip link set dev IFACE down
+
+# Addresses
+ip -br addr
+ip addr add 192.168.77.1/24 dev IFACE
+ip addr del 192.168.77.1/24 dev IFACE
+
+# Routes
+ip route
+ip route add default via 192.168.77.254 dev IFACE
+ip route add 10.0.0.0/8 via 192.168.77.254 dev IFACE
+ip route del 10.0.0.0/8
+
+# Neighbors (ARP/ND)
+ip neigh
+ip neigh flush dev IFACE
+
+# Show more details
+ip -details link show dev IFACE
+ip -4 -o addr show dev IFACE
+ip -6 -o addr show dev IFACE
+"""
+    )
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    s = " ".join(args.words).strip()
+    if not s:
+        die("nothing to explain")
+    words = [w.strip(",<>") for w in s.replace("<", " ").replace(">", " ").replace(",", " ").split()]
+    # normalize
+    out = []
+    for w in words:
+        key = w.lower()
+        # ip prints LOWER_UP not lower_up
+        key = key.replace("-", "_")
+        if key in TOKENS:
+            out.append((w, TOKENS[key]))
+    if not out:
+        print("No known tokens found. Try passing the exact words from 'ip addr' or 'ip link'.")
+        return
+    for w, desc in out:
+        print(f"{w}: {desc}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="daip", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("brief", help="small human-friendly status view (ip -br addr + routes)")
+    s.set_defaults(func=cmd_brief)
+
+    s = sub.add_parser("cheat", help="iproute2 90% cheat sheet")
+    s.set_defaults(func=cmd_cheat)
+
+    s = sub.add_parser("explain", help="explain tokens/flags from ip output")
+    s.add_argument("words", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_explain)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

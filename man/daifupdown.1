@@ -1,0 +1,19 @@
+.TH DAIFUPDOWN 1 "2026-01-02" "dumbass-tree" "User Commands"
+.SH NAME
+daifupdown \- ifupdown migration helper (generate interfaces, disable netplan YAML)
+.SH SYNOPSIS
+.B daifupdown
+[--dry-run] [-v] <command>
+.SH COMMANDS
+.TP
+.B plan
+Inspect netplan YAML, active services, resolv.conf wiring, and interfaces.
+.TP
+.B generate
+Generate /etc/network/interfaces content based on live interfaces (stdout by default).
+.TP
+.B generate --write
+Write /etc/network/interfaces with backup + two-tier warning.
+.TP
+.B disable-netplan
+Move /etc/netplan/*.yaml aside (disable netplan config) with two-tier warning.

@@ -1,0 +1,22 @@
+.TH DADNS 1 "2026-01-02" "dumbass-tree" "User Commands"
+.SH NAME
+dadns \- DNS sanity helper (systemd-resolved / resolv.conf / NetworkManager)
+.SH SYNOPSIS
+.B dadns
+[--dry-run] [-v] <command>
+.SH COMMANDS
+.TP
+.B status
+Show resolv.conf mode, service status, and (if available) resolvectl output.
+.TP
+.B set-mode stub|real|static
+Switch /etc/resolv.conf wiring with safety prompts.
+.TP
+.B stub-listener --on|--off
+Enable/disable systemd-resolved's 127.0.0.53 stub listener.
+.TP
+.B nm-dns systemd-resolved|default|none
+Set NetworkManager DNS plugin mode via a drop-in.
+.TP
+.B flush
+Flush systemd-resolved caches (resolvectl flush-caches).

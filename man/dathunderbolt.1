@@ -1,0 +1,33 @@
+.TH DATHUNDERBOLT 1 "2025-12-31" "dumbass-tree" "User Commands"
+.SH NAME
+dathunderbolt \- Thunderbolt authorization helper (boltctl wrapper)
+.SH SYNOPSIS
+.B dathunderbolt
+[--dry-run] [-v] [--yes]
+.I <command>
+.SH COMMANDS
+.TP
+.B status
+Show controller security, boltd status, and a device list.
+.TP
+.B list
+List Thunderbolt devices (including unauthorized ones).
+.TP
+.B domains
+Show Thunderbolt domains/controllers.
+.TP
+.B authorize <uuid>
+Authorize a device (temporary; does not store).
+.TP
+.B enroll <uuid>
+Authorize and remember a device (stores it in boltd database).
+.TP
+.B forget <uuid>
+Forget a previously enrolled device.
+.TP
+.B info <uuid>
+Show details about a device.
+.SH DESCRIPTION
+dathunderbolt is a dumbass-friendly wrapper around boltctl/boltd for authorizing Thunderbolt devices.
+.SH SEE ALSO
+boltctl(1), boltd(8)

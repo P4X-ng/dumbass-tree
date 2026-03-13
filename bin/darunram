@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""darunram - work in RAM, then optionally save back to disk.
+
+Your original thought: "execute in hugetlbfs and copy to disk so you don't lose work".
+Honest truth:
+- hugetlbfs is great for *hugepage-backed mmap/allocations*.
+- For "I want my build dir / scratch dir to be fast and disposable", tmpfs (/dev/shm) is usually the right tool.
+
+This tool does a simple, terminal-friendly workflow:
+
+darunram shell SRC_DIR
+  - copies SRC_DIR -> /dev/shm/<name>
+  - drops you into a subshell inside the RAM copy
+  - when you exit, you can rsync back (--persist) or discard
+
+This is not a perfect copy-on-write overlay; it's a pragmatic "stop thrashing my SSD while I experiment" helper.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+
+from dumbasslib import confirm_or_exit, die, info, require_cmd, run
+
+
+def cmd_shell(args: argparse.Namespace) -> None:
+    require_cmd("rsync")
+    src = pathlib.Path(args.src).resolve()
+    if not src.exists() or not src.is_dir():
+        die(f"not a directory: {src}")
+
+    base = src.name or "work"
+    dst = pathlib.Path(args.dst or f"/dev/shm/{base}-ram-{time.strftime('%Y%m%d-%H%M%S')}").resolve()
+
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"Copy {src} -> {dst} and open a shell there?",
+        reason="Large dirs can take time and RAM. This is a full copy, not COW.",
+        alternatives=[
+            "If you need true COW, use overlayfs (root) with lowerdir+upperdir on tmpfs.",
+            "Or copy only the subdir you actually need.",
+        ],
+    )
+
+    if not args.dry_run:
+        dst.mkdir(parents=True, exist_ok=True)
+        run(["rsync", "-a", "--delete", f"{src}/", f"{dst}/"], verbose=args.verbose)
+
+    info("Entering RAM shell. Exit to return.")
+    shell = os.environ.get("SHELL", "/bin/bash")
+    if not args.dry_run:
+        subprocess.run([shell], cwd=str(dst))
+
+    if args.persist:
+        confirm_or_exit(
+            yes=args.yes,
+            dry_run=args.dry_run,
+            prompt=f"Persist changes back to {src} (rsync back)?",
+            reason="This overwrites the destination with the RAM copy state.",
+            alternatives=["Skip --persist and manually copy only what you want."],
+        )
+        if not args.dry_run:
+            run(["rsync", "-a", "--delete", f"{dst}/", f"{src}/"], verbose=args.verbose)
+            info("persisted changes back to disk")
+    else:
+        info("Not persisting (RAM copy remains until reboot or manual delete).")
+        print(f"RAM dir: {dst}")
+        print("Delete it when done:")
+        print(f"  rm -rf {dst}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="darunram", description=__doc__)
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--dry-run", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("shell", help="copy dir to /dev/shm and open a shell there")
+    s.add_argument("src")
+    s.add_argument("--dst", help="destination dir in tmpfs (default: /dev/shm/<name>-ram-<ts>)")
+    s.add_argument("--persist", action="store_true", help="rsync changes back on exit")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_shell)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

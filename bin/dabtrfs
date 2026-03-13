@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""dabtrfs - dumbass-friendly Btrfs helper (Linux).
+
+Focus areas:
+- subvolume create/list/delete
+- snapshots
+- scrub start/status
+- balance start (with simple filters)
+- filesystem df/usage
+- mount with common options (compression, noatime)
+
+This is a shortcut generator + guardrails, not a full management suite.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+_THIS = Path(__file__).resolve()
+sys.path.insert(0, str(_THIS.parent))
+
+from dumbasslib import confirm_or_exit, die, require_cmds, require_root, run, warn  # noqa: E402
+
+
+def cmd_subvol_create(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["btrfs"])
+    run(["btrfs", "subvolume", "create", args.path], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_subvol_list(args: argparse.Namespace) -> None:
+    require_cmds(["btrfs"])
+    argv = ["btrfs", "subvolume", "list"]
+    if args.parents:
+        argv.append("-p")
+    argv.append(args.mountpoint)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_subvol_delete(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["btrfs"])
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"About to DELETE Btrfs subvolume {args.path!r}.",
+        reason="Subvolume deletion is permanent (unless you have a snapshot).",
+        alternatives=[
+            "List subvolumes: btrfs subvolume list <mountpoint>",
+            "Take a snapshot first: btrfs subvolume snapshot -r <src> <dst>",
+            "Use --dry-run first",
+        ],
+        typed=f"DELETE {args.path}",
+    )
+    run(["btrfs", "subvolume", "delete", args.path], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_snapshot(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["btrfs"])
+    argv = ["btrfs", "subvolume", "snapshot"]
+    if args.readonly:
+        argv.append("-r")
+    argv += [args.src, args.dst]
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_scrub_start(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["btrfs"])
+    # -B: wait, -d: print details
+    argv = ["btrfs", "scrub", "start", "-Bd", args.mountpoint]
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_scrub_status(args: argparse.Namespace) -> None:
+    require_cmds(["btrfs"])
+    run(["btrfs", "scrub", "status", args.mountpoint], dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_balance_start(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["btrfs"])
+    argv = ["btrfs", "balance", "start"]
+    if args.dusage is not None:
+        argv.append(f"-dusage={args.dusage}")
+    if args.musage is not None:
+        argv.append(f"-musage={args.musage}")
+    argv.append(args.mountpoint)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_df(args: argparse.Namespace) -> None:
+    require_cmds(["btrfs"])
+    run(["btrfs", "filesystem", "df", args.mountpoint], dry_run=args.dry_run, verbose=args.verbose)
+    run(
+        ["btrfs", "filesystem", "usage", args.mountpoint],
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+        check=False,
+    )
+
+
+def cmd_mount(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["mount"])
+
+    mp = Path(args.mountpoint)
+    if not mp.exists():
+        if args.dry_run or args.verbose > 0:
+            print(f"$ mkdir -p {mp}", file=sys.stderr)
+        if not args.dry_run:
+            mp.mkdir(parents=True, exist_ok=True)
+
+    opts = []
+    if args.compress:
+        # allow values like "zstd:3", "lzo", "zstd", ...
+        opts.append(f"compress={args.compress}")
+    if args.compress_force:
+        opts.append(f"compress-force={args.compress_force}")
+    if args.noatime:
+        opts.append("noatime")
+    if args.ssd:
+        opts.append("ssd")
+    if args.space_cache_v2:
+        opts.append("space_cache=v2")
+    if args.subvol:
+        opts.append(f"subvol={args.subvol}")
+    if args.options:
+        # raw, comma-separated string from user
+        opts.append(args.options)
+
+    argv = ["mount", "-t", "btrfs"]
+    if opts:
+        argv += ["-o", ",".join(opts)]
+    argv += [args.device, str(mp)]
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def cmd_mkfs(args: argparse.Namespace) -> None:
+    require_root()
+    require_cmds(["mkfs.btrfs"])
+    confirm_or_exit(
+        yes=args.yes,
+        dry_run=args.dry_run,
+        prompt=f"About to FORMAT {args.device!r} as Btrfs and mount at {args.mountpoint!r}.",
+        reason="Formatting will destroy any existing filesystem/data on that device.",
+        alternatives=[
+            "Verify the device with: lsblk -o NAME,SIZE,MODEL,SERIAL",
+            "If you only meant to mount an existing filesystem, use: dabtrfs mount <dev> <mnt>",
+            "Use --dry-run first",
+        ],
+        typed=f"FORMAT {args.device}",
+    )
+    argv = ["mkfs.btrfs"]
+    if args.force:
+        argv.append("-f")
+    if args.label:
+        argv += ["-L", args.label]
+    argv.append(args.device)
+    run(argv, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dabtrfs", description="dumbass-friendly Btrfs helper (Linux)")
+    p.add_argument("--dry-run", action="store_true", help="print commands instead of executing")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="more output (repeatable)")
+
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    # mkfs
+    pmk = sp.add_parser("mkfs", help="format a device as btrfs (DANGEROUS)")
+    pmk.add_argument("device")
+    pmk.add_argument("--label", help="filesystem label")
+    pmk.add_argument("-f", "--force", action="store_true", help="pass -f to mkfs.btrfs (overwrite)")
+    pmk.add_argument("--yes", action="store_true", help="required: really format it")
+    pmk.set_defaults(func=cmd_mkfs)
+
+    # mount
+    pm = sp.add_parser("mount", help="mount btrfs with common options")
+    pm.add_argument("device")
+    pm.add_argument("mountpoint")
+    pm.add_argument("--compress", help="mount compression, e.g. zstd:3, lzo")
+    pm.add_argument("--compress-force", help="force compression, e.g. zstd:3")
+    pm.add_argument("--noatime", action="store_true")
+    pm.add_argument("--ssd", action="store_true")
+    pm.add_argument("--space-cache-v2", action="store_true")
+    pm.add_argument("--subvol", help="subvolume to mount (e.g. @home)")
+    pm.add_argument("--options", help="extra raw mount options (comma-separated)")
+    pm.set_defaults(func=cmd_mount)
+
+    # subvol group
+    psv = sp.add_parser("subvol", help="subvolume operations")
+    psvs = psv.add_subparsers(dest="sub_cmd", required=True)
+
+    psvc = psvs.add_parser("create", help="create subvolume")
+    psvc.add_argument("path")
+    psvc.set_defaults(func=cmd_subvol_create)
+
+    psvl = psvs.add_parser("list", help="list subvolumes")
+    psvl.add_argument("mountpoint")
+    psvl.add_argument("-p", "--parents", action="store_true", help="show parent ids")
+    psvl.set_defaults(func=cmd_subvol_list)
+
+    psvd = psvs.add_parser("delete", help="delete subvolume (DANGEROUS)")
+    psvd.add_argument("path")
+    psvd.add_argument("--yes", action="store_true", help="required: really delete it")
+    psvd.set_defaults(func=cmd_subvol_delete)
+
+    # snapshot
+    psn = sp.add_parser("snapshot", help="create snapshot of a subvolume")
+    psn.add_argument("src")
+    psn.add_argument("dst")
+    psn.add_argument("-r", "--readonly", action="store_true")
+    psn.set_defaults(func=cmd_snapshot)
+
+    # scrub group
+    pscrub = sp.add_parser("scrub", help="scrub operations")
+    pscrubs = pscrub.add_subparsers(dest="scrub_cmd", required=True)
+
+    psstart = pscrubs.add_parser("start", help="start a scrub and wait")
+    psstart.add_argument("mountpoint")
+    psstart.set_defaults(func=cmd_scrub_start)
+
+    psst = pscrubs.add_parser("status", help="scrub status")
+    psst.add_argument("mountpoint")
+    psst.set_defaults(func=cmd_scrub_status)
+
+    # balance group
+    pbal = sp.add_parser("balance", help="balance operations")
+    pbals = pbal.add_subparsers(dest="bal_cmd", required=True)
+
+    pbstart = pbals.add_parser("start", help="start a filtered balance")
+    pbstart.add_argument("mountpoint")
+    pbstart.add_argument("--dusage", type=int, help="data usage filter percent, e.g. 50")
+    pbstart.add_argument("--musage", type=int, help="metadata usage filter percent, e.g. 50")
+    pbstart.set_defaults(func=cmd_balance_start)
+
+    # df
+    pdf = sp.add_parser("df", help="show btrfs filesystem usage")
+    pdf.add_argument("mountpoint")
+    pdf.set_defaults(func=cmd_df)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        warn("interrupted")
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()
